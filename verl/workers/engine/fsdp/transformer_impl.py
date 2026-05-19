@@ -1237,6 +1237,33 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 loss = torch.tensor(1.0, device=device_name)
                 metrics = {}
 
+            # Optional consistency loss (interleaved noisy+clean forward
+            # under SDPA). Active only when CONSISTENCY_ENABLE=1;
+            # default-disabled, so the standard AR path is unchanged.
+            if not forward_only and loss_function is not None:
+                try:
+                    import os as _os
+                    import sys as _sys
+                    # scripts/ lives at <repo>/scripts; this file is at
+                    # <repo>/verl/workers/engine/fsdp/transformer_impl.py
+                    _scripts_dir = _os.path.normpath(
+                        _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                                      "..", "..", "..", "..", "scripts")
+                    )
+                    _scripts_dir = _os.environ.get("CONSISTENCY_SCRIPTS_DIR", _scripts_dir)
+                    if _scripts_dir not in _sys.path:
+                        _sys.path.insert(0, _scripts_dir)
+                    from consistency.verl_hook import maybe_add_consistency_loss
+                    loss = maybe_add_consistency_loss(self, micro_batch, loss, metrics)
+                except Exception as _e:  # noqa: BLE001
+                    # Don't break training if the hook fails; surface in logs.
+                    if not getattr(self, "_consistency_warn_seen", False):
+                        import logging as _logging
+                        _logging.getLogger(__name__).warning(
+                            "consistency hook skipped: %s", _e
+                        )
+                        self._consistency_warn_seen = True
+
             output = {
                 "model_output": model_output,
                 "loss": loss.detach().item(),

@@ -1,0 +1,163 @@
+"""Build the Decode-Learning interleaved `[prompt, k_0, last_0, ...]` batch
+from verl's standard (prompt, response) rollouts.
+
+  k_j   (noisy block):  initialized from existing sequence tokens (matches
+                         JF's `random.choice(generated_ids)` init)
+  last_j (clean block): copy of the j-th block of the rollout response
+
+Both k_j and last_j get the SAME position_ids — they represent two views
+of the same Jacobi step (essential for RoPE consistency at the model
+level).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import torch
+
+
+@dataclass
+class InterleavedBatch:
+    input_ids: torch.Tensor          # (B, Lmax) int64
+    position_ids: torch.Tensor       # (B, Lmax) int64 — shared positions per pair
+    prompt_lens: torch.Tensor        # (B,) int64
+    num_pairs: torch.Tensor          # (B,) int64 — T per sample
+    block_lens: torch.Tensor         # (B,) int64 — N per sample (currently uniform)
+    seq_lens: torch.Tensor           # (B,) int64
+    pad_mask: torch.Tensor           # (B, Lmax) bool — True where valid
+    noisy_mask: torch.Tensor         # (B, Lmax) bool — True at draft (noisy-block) positions
+
+    def to(self, device):
+        return InterleavedBatch(
+            input_ids=self.input_ids.to(device),
+            position_ids=self.position_ids.to(device),
+            prompt_lens=self.prompt_lens.to(device),
+            num_pairs=self.num_pairs.to(device),
+            block_lens=self.block_lens.to(device),
+            seq_lens=self.seq_lens.to(device),
+            pad_mask=self.pad_mask.to(device),
+            noisy_mask=self.noisy_mask.to(device),
+        )
+
+
+def build_interleaved_batch(
+    prompt_ids: list[torch.Tensor],
+    response_ids: list[torch.Tensor],
+    block_size: int,
+    pad_id: int,
+    max_pairs: int | None = None,
+    generator: torch.Generator | None = None,
+) -> InterleavedBatch:
+    """Build the interleaved batch from a list of (prompt, response) tensors.
+
+    For each sample with response of length R:
+      T = ceil(R / block_size) clean blocks, each of length N=block_size
+        (last block right-padded with pad_id to N if R % N != 0)
+      For each clean block last_j (positions [P + (2j+1)N, P + (2j+2)N) in the
+      packed sequence), construct a paired noisy block k_j (positions
+      [P + 2jN, P + (2j+1)N)) by sampling `block_size` tokens uniformly
+      with replacement from (prompt + response). This matches the JF
+      inference prefill init (random.choice from generated_ids).
+
+    The total packed length per sample is P + 2*T*N. Across the batch,
+    we pad to the max packed length with pad_id.
+    """
+    assert len(prompt_ids) == len(response_ids)
+    B = len(prompt_ids)
+    N = int(block_size)
+
+    # Per-sample packed lengths
+    P = torch.tensor([int(p.numel()) for p in prompt_ids], dtype=torch.long)
+    Rn = torch.tensor([int(r.numel()) for r in response_ids], dtype=torch.long)
+    T_full = ((Rn + N - 1) // N).long()
+    if max_pairs is not None:
+        T_full = torch.minimum(T_full, torch.tensor(int(max_pairs), dtype=torch.long))
+    seq_lens = P + 2 * T_full * N
+    Lmax_raw = int(seq_lens.max().item())
+    # flex_attention backward Triton kernel is unreliable when Lmax isn't
+    # a multiple of its internal block tile (typically 128). Pad up.
+    BLOCK_TILE = 128
+    Lmax = ((Lmax_raw + BLOCK_TILE - 1) // BLOCK_TILE) * BLOCK_TILE
+    Lmax = max(Lmax, BLOCK_TILE)
+
+    input_ids = torch.full((B, Lmax), int(pad_id), dtype=torch.long)
+    position_ids = torch.zeros((B, Lmax), dtype=torch.long)
+    pad_mask = torch.zeros((B, Lmax), dtype=torch.bool)
+    noisy_mask = torch.zeros((B, Lmax), dtype=torch.bool)
+
+    for b in range(B):
+        Pb = int(P[b].item())
+        Tb = int(T_full[b].item())
+        # prompt section
+        input_ids[b, :Pb] = prompt_ids[b]
+        position_ids[b, :Pb] = torch.arange(Pb, dtype=torch.long)
+        pad_mask[b, :Pb] = True
+
+        # Noisy-init pool = prompt + response actual tokens (no pad)
+        # Source switch via env var: "sample" (default, original behavior) draws
+        # noise from this sample's own prompt+response → OCI-flavored noise.
+        # "uniform" draws from the entire vocab uniformly → no distribution bias.
+        # Theory: OCI-flavored noise builds an OCI-prior into the denoising
+        # mechanism, which then leaks into AR generation via shared parameters.
+        # Uniform noise removes that bias.
+        import os as _os
+        _noise_source = _os.environ.get("CONSISTENCY_NOISE_SOURCE", "sample").lower()
+        _vocab_size = int(_os.environ.get("CONSISTENCY_VOCAB_SIZE", "152064"))
+        pool = torch.cat([prompt_ids[b].long(), response_ids[b].long()])
+        for j in range(Tb):
+            ks = Pb + 2 * j * N
+            ls = Pb + (2 * j + 1) * N
+            # clean block: response[j*N : (j+1)*N], right-padded
+            r_start = j * N
+            r_end = min((j + 1) * N, int(Rn[b].item()))
+            valid_n = r_end - r_start
+            if valid_n > 0:
+                input_ids[b, ls : ls + valid_n] = response_ids[b][r_start:r_end]
+                pad_mask[b, ls : ls + valid_n] = True
+            # noisy block: N tokens sampled with replacement
+            if _noise_source == "uniform":
+                if generator is not None:
+                    noisy_toks = torch.randint(low=0, high=_vocab_size, size=(N,),
+                                                generator=generator, dtype=torch.long)
+                else:
+                    noisy_toks = torch.randint(low=0, high=_vocab_size, size=(N,),
+                                                dtype=torch.long)
+                input_ids[b, ks : ks + N] = noisy_toks
+            else:  # "sample" — original: from this sample's prompt+response
+                if generator is not None:
+                    idx = torch.randint(low=0, high=int(pool.numel()), size=(N,), generator=generator)
+                else:
+                    idx = torch.randint(low=0, high=int(pool.numel()), size=(N,))
+                input_ids[b, ks : ks + N] = pool[idx]
+            pad_mask[b, ks : ks + N] = True
+            noisy_mask[b, ks : ks + N] = True
+            # shared position ids: both blocks at the same true positions
+            shared_pos = torch.arange(Pb + j * N, Pb + (j + 1) * N, dtype=torch.long)
+            position_ids[b, ks : ks + N] = shared_pos
+            position_ids[b, ls : ls + N] = shared_pos
+
+    return InterleavedBatch(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        prompt_lens=P,
+        num_pairs=T_full,
+        block_lens=torch.full((B,), N, dtype=torch.long),
+        seq_lens=seq_lens,
+        pad_mask=pad_mask,
+        noisy_mask=noisy_mask,
+    )
+
+
+if __name__ == "__main__":
+    # quick self-test
+    g = torch.Generator().manual_seed(42)
+    prompt_ids = [torch.tensor([1, 2, 3, 4, 5]), torch.tensor([10, 11, 12])]
+    response_ids = [torch.tensor([20, 21, 22, 23, 24, 25, 26, 27]),
+                    torch.tensor([30, 31, 32, 33])]
+    b = build_interleaved_batch(prompt_ids, response_ids, block_size=4, pad_id=0, generator=g)
+    print("seq_lens:", b.seq_lens.tolist())
+    print("num_pairs:", b.num_pairs.tolist())
+    print("input_ids[0]:", b.input_ids[0].tolist())
+    print("position_ids[0]:", b.position_ids[0].tolist())
+    print("pad_mask[0]:", b.pad_mask[0].tolist())
