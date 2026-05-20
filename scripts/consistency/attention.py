@@ -31,14 +31,68 @@ def make_mask_mod(
     num_pairs: torch.Tensor,
     block_lens: torch.Tensor,
     pad_mask: torch.Tensor,
+    triple_mode: bool = False,
 ):
     """Build a mask_mod closure with batched per-sample metadata baked in.
-    Returns a callable `(b, h, q, k) -> bool` (broadcastable)."""
+    Returns a callable `(b, h, q, k) -> bool` (broadcastable).
+
+    - 2-block mode (default): [prompt | noisy | clean | noisy | clean | ...]
+      Triple j has 2 sub-blocks; block_idx_q % 2 == 0 → noisy, == 1 → clean.
+    - 3-block mode: [prompt | marked | unmarked | clean | marked | unmarked | clean | ...]
+      Triple j has 3 sub-blocks; block_idx_q % 3 == 0 → marked-noisy,
+      == 1 → unmarked-noisy, == 2 → clean. marked and unmarked do NOT attend
+      to each other (they share RoPE positions but are independent slots).
+    """
     P_t = prompt_lens
     T_t = num_pairs
     N_t = torch.clamp(block_lens, min=1)
     V_t = pad_mask
 
+    if not triple_mode:
+        def mask_mod(b, h, q, k):
+            b = b.long()
+            p = P_t[b]
+            T = T_t[b]
+            N = N_t[b]
+            in_range = V_t[b, q] & V_t[b, k]
+
+            is_prompt_q = q < p
+            is_prompt_k = k < p
+            mask_prompt = is_prompt_q & (k <= q)
+
+            rel_q = q - p
+            rel_k = k - p
+            block_idx_q = torch.div(rel_q, N, rounding_mode="floor")
+            block_idx_k = torch.div(rel_k, N, rounding_mode="floor")
+
+            is_noisy_q = (~is_prompt_q) & (block_idx_q % 2 == 0)
+            is_clean_q = (~is_prompt_q) & (block_idx_q % 2 == 1)
+            is_noisy_k = (~is_prompt_k) & (block_idx_k % 2 == 0)
+            is_clean_k = (~is_prompt_k) & (block_idx_k % 2 == 1)
+
+            Tmax = torch.maximum(T - 1, torch.zeros_like(T))
+            j_q_unc = block_idx_q // 2
+            j_q = torch.minimum(torch.maximum(j_q_unc, torch.zeros_like(j_q_unc)), Tmax)
+
+            ks_ = p + 2 * j_q * N
+            ls_ = p + (2 * j_q + 1) * N
+
+            clean_in_prev_clean = is_clean_k & (block_idx_k < 2 * j_q)
+            same_noisy_block = is_noisy_q & is_noisy_k & (block_idx_q == block_idx_k)
+            same_clean_block = is_clean_q & is_clean_k & (block_idx_q == block_idx_k)
+
+            same_noisy_attn = same_noisy_block & (k >= ks_) & (k <= q)
+
+            mask_noisy = is_noisy_q & (is_prompt_k | clean_in_prev_clean | same_noisy_attn)
+            mask_clean = is_clean_q & (
+                is_prompt_k | clean_in_prev_clean | (same_clean_block & (k >= ls_) & (k <= q))
+            )
+
+            return in_range & (mask_prompt | mask_noisy | mask_clean)
+
+        return mask_mod
+
+    # 3-block (triple) mode.
     def mask_mod(b, h, q, k):
         b = b.long()
         p = P_t[b]
@@ -55,31 +109,49 @@ def make_mask_mod(
         block_idx_q = torch.div(rel_q, N, rounding_mode="floor")
         block_idx_k = torch.div(rel_k, N, rounding_mode="floor")
 
-        is_noisy_q = (~is_prompt_q) & (block_idx_q % 2 == 0)
-        is_clean_q = (~is_prompt_q) & (block_idx_q % 2 == 1)
-        is_noisy_k = (~is_prompt_k) & (block_idx_k % 2 == 0)
-        is_clean_k = (~is_prompt_k) & (block_idx_k % 2 == 1)
+        sub_q = block_idx_q % 3
+        sub_k = block_idx_k % 3
+        is_marked_q   = (~is_prompt_q) & (sub_q == 0)
+        is_unmarked_q = (~is_prompt_q) & (sub_q == 1)
+        is_clean_q    = (~is_prompt_q) & (sub_q == 2)
+        is_marked_k   = (~is_prompt_k) & (sub_k == 0)
+        is_unmarked_k = (~is_prompt_k) & (sub_k == 1)
+        is_clean_k    = (~is_prompt_k) & (sub_k == 2)
 
         Tmax = torch.maximum(T - 1, torch.zeros_like(T))
-        j_q_unc = block_idx_q // 2
+        j_q_unc = block_idx_q // 3
         j_q = torch.minimum(torch.maximum(j_q_unc, torch.zeros_like(j_q_unc)), Tmax)
 
-        ks_ = p + 2 * j_q * N
-        ls_ = p + (2 * j_q + 1) * N
+        # Per-block start positions (within the packed sequence).
+        ms_ = p + 3 * j_q * N
+        us_ = p + (3 * j_q + 1) * N
+        ls_ = p + (3 * j_q + 2) * N
 
-        clean_in_prev_clean = is_clean_k & (block_idx_k < 2 * j_q)
-        same_noisy_block = is_noisy_q & is_noisy_k & (block_idx_q == block_idx_k)
-        same_clean_block = is_clean_q & is_clean_k & (block_idx_q == block_idx_k)
+        # Previous clean blocks are at sub_k == 2 with block_idx_k < 3*j_q.
+        clean_in_prev_clean = is_clean_k & (block_idx_k < 3 * j_q)
 
-        # Jacobi mode: causal within the noisy block.
-        same_noisy_attn = same_noisy_block & (k >= ks_) & (k <= q)
+        same_triple = (j_q_unc == (block_idx_k // 3))
+        same_marked = is_marked_q & is_marked_k & same_triple
+        same_unmarked = is_unmarked_q & is_unmarked_k & same_triple
+        same_clean = is_clean_q & is_clean_k & same_triple
 
-        mask_noisy = is_noisy_q & (is_prompt_k | clean_in_prev_clean | same_noisy_attn)
+        # Jacobi-style intra-block attention for noisy slots; causal within block.
+        same_marked_attn = same_marked & (k >= ms_) & (k <= q)
+        same_unmarked_attn = same_unmarked & (k >= us_) & (k <= q)
+        # Causal within the clean block.
+        same_clean_attn = same_clean & (k >= ls_) & (k <= q)
+
+        mask_marked = is_marked_q & (
+            is_prompt_k | clean_in_prev_clean | same_marked_attn
+        )
+        mask_unmarked = is_unmarked_q & (
+            is_prompt_k | clean_in_prev_clean | same_unmarked_attn
+        )
         mask_clean = is_clean_q & (
-            is_prompt_k | clean_in_prev_clean | (same_clean_block & (k >= ls_) & (k <= q))
+            is_prompt_k | clean_in_prev_clean | same_clean_attn
         )
 
-        return in_range & (mask_prompt | mask_noisy | mask_clean)
+        return in_range & (mask_prompt | mask_marked | mask_unmarked | mask_clean)
 
     return mask_mod
 
@@ -91,13 +163,14 @@ def build_sdpa_attention_mask(
     pad_mask: torch.Tensor,
     device,
     dtype=torch.float32,
+    triple_mode: bool = False,
 ) -> torch.Tensor:
     """Materialize the boolean attention pattern into a (B, 1, Lmax, Lmax)
     additive float mask. 0.0 = allowed, -inf = blocked. SDPA broadcasts
     over the head dimension.
     """
     B, Lmax = pad_mask.shape
-    fn = make_mask_mod(prompt_lens, num_pairs, block_lens, pad_mask)
+    fn = make_mask_mod(prompt_lens, num_pairs, block_lens, pad_mask, triple_mode=triple_mode)
 
     b_idx = torch.arange(B, device=device).view(B, 1, 1).expand(B, Lmax, Lmax)
     h_idx = torch.zeros((1,), dtype=torch.long, device=device)  # broadcastable

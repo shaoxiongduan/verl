@@ -59,7 +59,58 @@ from consistency.loss import compute_consistency_loss  # noqa: E402
 
 
 _DIAG_DUMPED = False  # one-shot diagnostic guard (per worker process)
-_TEACHER_MODEL = None  # frozen base teacher (lazy-loaded, per worker process)
+_TEACHER_MODEL = None  # frozen base teacher OR EMA teacher (lazy-loaded, per worker process)
+_TEACHER_MODE = None   # "base" or "ema"; tracks which type of teacher is loaded
+_EMA_STEP_COUNT = 0
+_MARKER_EMBED = None   # marker row loaded from disk (per worker process)
+
+
+def _get_marker_embed_from_disk(model_path: str, marker_id: int, device, dtype):
+    """Load row `marker_id` of the HF model's input-embedding from safetensors
+    on disk. Returns a regular tensor with stable own storage, identical on all
+    ranks. Bypasses FSDP entirely — FSDP-sharded views of `embed.weight[marker_id]`
+    have size-0 storage on non-owner ranks, which crashes when used in a (B,L,H)
+    broadcast. This caches the result module-globally per worker.
+
+    Frozen: no gradient flow back to the actual embed table. We accept that as
+    a trade-off; the marker's *function* (gating) is what matters for the
+    experiment, not its in-training learnability.
+    """
+    global _MARKER_EMBED
+    if _MARKER_EMBED is not None:
+        return _MARKER_EMBED
+    import json
+    import os as _os_local
+    from safetensors.torch import load_file as _st_load
+    # Find which shard has model.embed_tokens.weight
+    embed_key_candidates = ("model.embed_tokens.weight",)
+    index_path = _os_local.path.join(model_path, "model.safetensors.index.json")
+    target_file = None
+    target_key = None
+    if _os_local.path.exists(index_path):
+        with open(index_path) as f:
+            index = json.load(f)
+        wm = index.get("weight_map", {})
+        for k in embed_key_candidates:
+            if k in wm:
+                target_file = _os_local.path.join(model_path, wm[k])
+                target_key = k
+                break
+    if target_file is None:
+        # Try a single-file ckpt as fallback
+        single = _os_local.path.join(model_path, "model.safetensors")
+        if _os_local.path.exists(single):
+            target_file = single
+            target_key = embed_key_candidates[0]
+    if target_file is None:
+        raise RuntimeError(f"could not locate embed shard under {model_path!r}")
+    print(f"[cons-marker] reading embed shard {target_file!r} key={target_key!r}", flush=True)
+    embed_full = _st_load(target_file)[target_key]
+    marker = embed_full[marker_id].detach().clone().to(device).to(dtype)
+    _MARKER_EMBED = marker
+    print(f"[cons-marker] marker loaded id={marker_id} shape={tuple(marker.shape)} "
+          f"norm={float(marker.float().norm().item()):.4f}", flush=True)
+    return _MARKER_EMBED
 
 
 def _get_base_teacher(student_model, teacher_path: str):
@@ -70,7 +121,7 @@ def _get_base_teacher(student_model, teacher_path: str):
     so each FSDP rank holds its own full (not sharded) copy. For 7B bf16
     that's ~14 GB per H200 rank, which is fine.
     """
-    global _TEACHER_MODEL
+    global _TEACHER_MODEL, _TEACHER_MODE
     if _TEACHER_MODEL is not None:
         return _TEACHER_MODEL
     from transformers import AutoModelForCausalLM  # local import to avoid cost when disabled
@@ -89,8 +140,81 @@ def _get_base_teacher(student_model, teacher_path: str):
         prm.requires_grad = False
     m.to(device)
     _TEACHER_MODEL = m
+    _TEACHER_MODE = "base"
     print(f"[cons-teacher] base teacher loaded; params={sum(p.numel() for p in m.parameters())/1e9:.2f} B", flush=True)
     return _TEACHER_MODEL
+
+
+def _get_ema_teacher(student_model, init_path: str):
+    """Initialize (once) an EMA-tracking teacher model. Loaded from
+    `init_path` (typically the same HF dir as the student's base ckpt; at
+    step 0 EMA = student = base). Each rank holds its own full copy and
+    updates it in lockstep via `_ema_update_from_student`.
+    """
+    global _TEACHER_MODEL, _TEACHER_MODE
+    if _TEACHER_MODEL is not None:
+        return _TEACHER_MODEL
+    from transformers import AutoModelForCausalLM
+    p = next(student_model.parameters())
+    device, dtype = p.device, p.dtype
+    print(
+        f"[cons-ema] initializing EMA teacher from {init_path!r} "
+        f"-> device={device} dtype={dtype}",
+        flush=True,
+    )
+    m = AutoModelForCausalLM.from_pretrained(init_path, torch_dtype=dtype)
+    m.eval()
+    for prm in m.parameters():
+        prm.requires_grad = False
+    m.to(device)
+    _TEACHER_MODEL = m
+    _TEACHER_MODE = "ema"
+    print(f"[cons-ema] EMA teacher initialized; params={sum(p.numel() for p in m.parameters())/1e9:.2f} B", flush=True)
+    return _TEACHER_MODEL
+
+
+@torch.no_grad()
+def _ema_update_from_student(student_model, ema_model, decay: float) -> None:
+    """In-place EMA update: ema = decay*ema + (1-decay)*student.
+
+    Uses FSDP.summon_full_params to materialize the unsharded student weights
+    on each rank. Per-rank EMA is a full copy of the model, so the update
+    is symmetric across ranks (same student full-params, same EMA shapes).
+
+    Call this once per training step; cheap relative to the optimizer step.
+    """
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+    ema_params = {n: p for n, p in ema_model.named_parameters()}
+    # `writeback=False` prevents FSDP from re-scattering the unsharded params
+    # back into the shards on exit — we only need to READ the student.
+    try:
+        with FSDP.summon_full_params(student_model, writeback=False, offload_to_cpu=False):
+            for name, sp in student_model.named_parameters():
+                # FSDP may not expose original param names — try several
+                # variants to find the matching ema param.
+                ema_p = ema_params.get(name)
+                if ema_p is None:
+                    cleaned = name.replace("_fsdp_wrapped_module.", "").replace(".module.", ".")
+                    ema_p = ema_params.get(cleaned)
+                if ema_p is None:
+                    # Try stripping the leading "module." that FSDP/DDP often adds.
+                    if name.startswith("module."):
+                        ema_p = ema_params.get(name[len("module."):])
+                if ema_p is None:
+                    continue
+                if ema_p.shape != sp.shape:
+                    continue
+                ema_p.data.mul_(decay).add_(sp.data.to(ema_p.dtype), alpha=1.0 - decay)
+    except Exception as _e:  # noqa: BLE001
+        # If summon_full_params isn't available (non-FSDP path), fall back to
+        # direct param iteration. Will be wrong under FSDP sharding, but the
+        # warning above is the user's signal something's off.
+        for name, sp in student_model.named_parameters():
+            ema_p = ema_params.get(name)
+            if ema_p is None or ema_p.shape != sp.shape:
+                continue
+            ema_p.data.mul_(decay).add_(sp.data.to(ema_p.dtype), alpha=1.0 - decay)
 
 
 def _dump_micro_batch_structure(micro_batch) -> None:
@@ -315,12 +439,18 @@ def maybe_add_consistency_loss(
     pl = [prompt_list[i] for i in idx]
     rl = [response_list[i] for i in idx]
 
-    # Optional frozen teacher (pre-RL base). When CONSISTENCY_TEACHER=base
-    # the cons loss target switches from the live student's clean-view logits
-    # to a frozen base model's clean-view logits. Decouples the cons target
-    # from the RL-evolving policy, preventing reinforcement of mode collapse.
+    # Teacher selection.
+    #   "self" (default): cons target = student's own clean-view logits (CLLM-style).
+    #   "base": cons target = frozen pre-RL base model's clean-view logits.
+    #   "ema":  cons target = EMA of student's params (DMD2 fake_score analog;
+    #           tracks current student so no "drag back to base"). Requires
+    #           CONSISTENCY_TEACHER_PATH for the EMA's initial weights (the
+    #           same path as the student's base ckpt is the natural choice).
     teacher_mode = _read("teacher", "self", lambda v: str(v).lower())
     teacher_path = _read("teacher_path", "", str)
+    ema_decay = _read("ema_decay", 0.999, float)
+    anchor_weight = _read("anchor_weight", 0.0, float)
+    anchor_mode = _read("anchor_mode", "clean", lambda v: str(v).lower())
     teacher_model = None
     if teacher_mode == "base":
         if not teacher_path:
@@ -329,8 +459,40 @@ def maybe_add_consistency_loss(
                 "to be set to the HF model dir of the frozen base teacher."
             )
         teacher_model = _get_base_teacher(engine.module, teacher_path)
+    elif teacher_mode == "ema":
+        if not teacher_path:
+            raise RuntimeError(
+                "CONSISTENCY_TEACHER=ema requires CONSISTENCY_TEACHER_PATH "
+                "(used as the EMA's initial weights — typically the base ckpt)."
+            )
+        teacher_model = _get_ema_teacher(engine.module, teacher_path)
+        # Update EMA from the current (FSDP-sharded) student. Skips on step 0
+        # since EMA == student at init.
+        global _EMA_STEP_COUNT
+        if _EMA_STEP_COUNT > 0:
+            _ema_update_from_student(engine.module, teacher_model, ema_decay)
+        _EMA_STEP_COUNT += 1
 
-    cons_loss, cons_metrics = compute_consistency_loss(
+    compute_anchor = anchor_weight > 0.0 and teacher_model is not None
+
+    # Load the marker embed from disk if marker is enabled (avoids the
+    # FSDP-sharded `embed.weight[marker_id]` size-0 storage problem).
+    use_marker = _read("use_draft_marker", False, lambda v: str(v).lower() in {"1", "true", "yes"})
+    marker_embed_override = None
+    if use_marker:
+        marker_path = _read("marker_path", "", str) or _read("teacher_path", "", str)
+        marker_id_local = _read("marker_token_id", 151665, int)
+        if marker_path:
+            try:
+                p = next(engine.module.parameters())
+                marker_embed_override = _get_marker_embed_from_disk(
+                    marker_path, marker_id_local, p.device, p.dtype,
+                )
+            except Exception as _e:  # noqa: BLE001
+                print(f"[cons-marker] failed to load marker from disk: {_e}", flush=True)
+                marker_embed_override = None
+
+    cons_loss, anchor_loss, cons_metrics = compute_consistency_loss(
         model=engine.module,
         prompt_ids=pl,
         response_ids=rl,
@@ -341,11 +503,20 @@ def maybe_add_consistency_loss(
         seed=seed,
         divergence=divergence,
         teacher_model=teacher_model,
+        compute_anchor=compute_anchor,
+        anchor_mode=anchor_mode,
+        marker_embed_override=marker_embed_override,
     )
     if metrics is not None:
         metrics["actor/cons_loss"] = float(cons_loss.detach().item())
         metrics["actor/cons_weight_effective"] = float(weight)
+        metrics["actor/anchor_weight_effective"] = float(anchor_weight)
+        if anchor_loss is not None:
+            metrics["actor/anchor_loss"] = float(anchor_loss.detach().item())
         for k, v in cons_metrics.items():
             metrics[f"actor/{k}"] = v
 
-    return loss + weight * cons_loss
+    total = loss + weight * cons_loss
+    if anchor_loss is not None:
+        total = total + anchor_weight * anchor_loss
+    return total

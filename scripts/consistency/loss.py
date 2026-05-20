@@ -8,6 +8,8 @@ training logic is untouched.
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn.functional as F
 
@@ -15,6 +17,22 @@ import contextlib
 
 from .attention import build_sdpa_attention_mask, swap_attention_impl
 from .pack import InterleavedBatch, build_interleaved_batch
+
+
+def _per_block_sinusoidal(T_max: int, H: int, device, dtype) -> torch.Tensor:
+    """Standard sinusoidal positional encoding indexed by block number.
+    Shape (T_max, H). Same formula as Vaswani et al.'s positional embedding,
+    just keyed by block index instead of token position. Plain CUDA tensor
+    with own storage on every rank — no FSDP entanglement.
+    """
+    pe = torch.zeros(T_max, H, device=device, dtype=torch.float32)
+    pos = torch.arange(T_max, device=device, dtype=torch.float32).unsqueeze(-1)  # (T_max, 1)
+    div_term = torch.exp(
+        torch.arange(0, H, 2, device=device, dtype=torch.float32) * (-math.log(10000.0) / H)
+    )
+    pe[:, 0::2] = torch.sin(pos * div_term)
+    pe[:, 1::2] = torch.cos(pos * div_term)
+    return pe.to(dtype)
 
 
 @contextlib.contextmanager
@@ -91,9 +109,8 @@ def soft_cross_entropy(predicts: torch.Tensor, targets: torch.Tensor, T_soft: fl
 def _identify_block_positions(
     batch: InterleavedBatch,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """For each sample b, return (b_idx, k_pos, l_pos): 1D index tensors
-    giving the (sample, position) pairs of noisy and clean blocks aligned
-    pair-by-pair. Used to gather student/teacher logits.
+    """For each sample b, return (b_idx, k_pos, l_pos): the (sample, position)
+    pairs of noisy and clean blocks aligned pair-by-pair. Used in 2-block mode.
 
     Output shapes: each is a flat int64 tensor of length sum_b T_b * N_b.
     """
@@ -127,6 +144,45 @@ def _identify_block_positions(
     return torch.cat(b_list), torch.cat(k_list), torch.cat(l_list)
 
 
+@torch.no_grad()
+def _identify_block_positions_triple(
+    batch: InterleavedBatch,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """3-block variant: returns (b_idx, m_pos, u_pos, l_pos) — sample,
+    marked-noisy, unmarked-noisy, clean — aligned triple-by-triple.
+    """
+    B = batch.input_ids.shape[0]
+    device = batch.input_ids.device
+    b_list, m_list, u_list, l_list = [], [], [], []
+    P = batch.prompt_lens
+    T = batch.num_pairs
+    N = batch.block_lens
+    pad = batch.pad_mask
+    for b in range(B):
+        Pb = int(P[b].item())
+        Tb = int(T[b].item())
+        Nb = int(N[b].item())
+        if Tb <= 0 or Nb <= 0:
+            continue
+        for j in range(Tb):
+            ms = Pb + 3 * j * Nb
+            us = Pb + (3 * j + 1) * Nb
+            ls = Pb + (3 * j + 2) * Nb
+            offs = torch.arange(Nb, dtype=torch.long, device=device)
+            keep = pad[b, ms : ms + Nb] & pad[b, us : us + Nb] & pad[b, ls : ls + Nb]
+            if not keep.any():
+                continue
+            kept_offs = offs[keep]
+            b_list.append(torch.full((kept_offs.numel(),), b, dtype=torch.long, device=device))
+            m_list.append(ms + kept_offs)
+            u_list.append(us + kept_offs)
+            l_list.append(ls + kept_offs)
+    if not b_list:
+        empty = torch.empty(0, dtype=torch.long, device=device)
+        return empty, empty, empty, empty
+    return torch.cat(b_list), torch.cat(m_list), torch.cat(u_list), torch.cat(l_list)
+
+
 def compute_consistency_loss(
     model,
     prompt_ids: list[torch.Tensor],
@@ -140,7 +196,10 @@ def compute_consistency_loss(
     device=None,
     divergence: str = "forward_kl",
     teacher_model=None,
-) -> tuple[torch.Tensor, dict]:
+    compute_anchor: bool = False,
+    anchor_mode: str = "clean",
+    marker_embed_override: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None, dict]:
     """One consistency forward + soft CE loss.
 
     Args:
@@ -168,7 +227,11 @@ def compute_consistency_loss(
     if seed is not None:
         gen = gen.manual_seed(int(seed))
 
-    # Build packed batch on CPU then ship to device.
+    # Build packed batch on CPU then ship to device. Triple_mode activates
+    # the (marked, unmarked, clean) 3-block layout for the noisy_unmarked
+    # anchor; gives the student both marked and unmarked noisy predictions
+    # in a SINGLE forward via block-diagonal attention masking.
+    triple_mode = (compute_anchor and anchor_mode == "noisy_unmarked")
     batch = build_interleaved_batch(
         prompt_ids=prompt_ids,
         response_ids=response_ids,
@@ -176,6 +239,7 @@ def compute_consistency_loss(
         pad_id=int(pad_id),
         max_pairs=max_pairs,
         generator=gen,
+        triple_mode=triple_mode,
     ).to(device)
 
     _diag_once = not getattr(compute_consistency_loss, "_diag_dumped", False)
@@ -215,6 +279,7 @@ def compute_consistency_loss(
         pad_mask=batch.pad_mask,
         device=device,
         dtype=model_dtype,
+        triple_mode=triple_mode,
     )
     if _diag_once:
         print(
@@ -241,8 +306,14 @@ def compute_consistency_loss(
     use_marker = _os.environ.get("CONSISTENCY_USE_DRAFT_MARKER", "0").lower() in {"1", "true", "yes"}
     marker_id = int(_os.environ.get("CONSISTENCY_MARKER_TOKEN_ID", "151665"))
     marker_scale = float(_os.environ.get("CONSISTENCY_MARKER_INIT_SCALE", "1.0"))
+    # marker_type: "embed" (default) = learnable row of the embed table (or
+    # disk-loaded via marker_embed_override); "sinusoidal" = fixed per-block
+    # sinusoidal encoding, no learnable params, no FSDP entanglement.
+    marker_type = _os.environ.get("CONSISTENCY_MARKER_TYPE", "embed").lower()
 
     inputs_embeds = None
+    embed_layer = None
+    marker_embed = None
     if use_marker:
         # Find the (FSDP-unwrapped) HF model so we can call get_input_embeddings()
         _emb_owner = model
@@ -252,24 +323,64 @@ def compute_consistency_loss(
                 break
             _emb_owner = inner
         embed_layer = _emb_owner.get_input_embeddings()
-        # token-side embedding of the draft tokens, unchanged
         inputs_embeds = embed_layer(batch.input_ids)
-        # marker = the (initially untrained) embedding row at marker_id
-        marker_embed = embed_layer.weight[marker_id].to(inputs_embeds.dtype)
-        # additive injection at noisy positions only
-        noisy_mask = batch.noisy_mask.to(inputs_embeds.dtype).unsqueeze(-1)
-        inputs_embeds = inputs_embeds + marker_scale * noisy_mask * marker_embed
-        if _diag_once:
-            print(
-                f"[cons-step] draft marker ENABLED id={marker_id} scale={marker_scale} "
-                f"marker_norm={float(marker_embed.float().norm().item()):.3f} "
-                f"n_noisy_positions={int(batch.noisy_mask.sum().item())}",
-                flush=True,
-            )
+        # In triple_mode we ONLY add the marker at the marked-noisy slot, not
+        # at unmarked-noisy. In 2-block mode the marker covers all noisy.
+        if triple_mode and batch.marked_mask is not None:
+            inject_mask = batch.marked_mask.to(inputs_embeds.dtype).unsqueeze(-1)
+        else:
+            inject_mask = batch.noisy_mask.to(inputs_embeds.dtype).unsqueeze(-1)
 
+        if marker_type == "sinusoidal":
+            # Per-block-index fixed sinusoidal encoding. Each noisy position
+            # gets the encoding indexed by which block it belongs to. No
+            # learnable params, no FSDP entanglement.
+            B_, L_, H_ = inputs_embeds.shape
+            T_max = int(batch.num_pairs.max().item()) if int(batch.num_pairs.numel()) else 1
+            T_max = max(T_max, 1)
+            pe_table = _per_block_sinusoidal(T_max, H_, inputs_embeds.device, inputs_embeds.dtype)  # (T_max, H)
+            # Compute per-position block index. Block stride depends on layout:
+            #   2-block: each block-pair is 2*N tokens after prompt.
+            #   3-block: each block-triple is 3*N tokens after prompt.
+            N_ = int(batch.block_lens[0].item())
+            stride_per_block = (3 if triple_mode else 2) * N_
+            P_ = batch.prompt_lens.unsqueeze(-1).to(inputs_embeds.device)  # (B, 1)
+            pos_arange = torch.arange(L_, device=inputs_embeds.device).unsqueeze(0).expand(B_, -1)  # (B, L)
+            rel = pos_arange - P_
+            # Clamp into valid range; we'll mask off non-noisy positions anyway.
+            block_idx = torch.clamp(rel.clamp_min(0) // stride_per_block, max=T_max - 1)  # (B, L)
+            encoding = pe_table[block_idx]  # (B, L, H)
+            inputs_embeds = inputs_embeds + marker_scale * inject_mask * encoding
+            if _diag_once:
+                print(
+                    f"[cons-step] draft marker ENABLED type=sinusoidal scale={marker_scale} "
+                    f"T_max={T_max} stride={stride_per_block} H={H_} "
+                    f"triple_mode={triple_mode} n_inject_positions={int(inject_mask.sum().item())}",
+                    flush=True,
+                )
+        else:
+            # Existing embed-table marker (learnable row, or disk-loaded override).
+            if marker_embed_override is not None:
+                marker_embed = marker_embed_override.to(inputs_embeds.dtype)
+            else:
+                marker_embed = embed_layer.weight[marker_id].detach().clone().to(inputs_embeds.dtype)
+            inputs_embeds = inputs_embeds + marker_scale * inject_mask * marker_embed
+            if _diag_once:
+                print(
+                    f"[cons-step] draft marker ENABLED type=embed id={marker_id} scale={marker_scale} "
+                    f"marker_norm={float(marker_embed.float().norm().item()):.3f} "
+                    f"triple_mode={triple_mode} n_inject_positions={int(inject_mask.sum().item())} "
+                    f"source={'override' if marker_embed_override is not None else 'embed.weight'}",
+                    flush=True,
+                )
+
+    # Single student forward through the (possibly 3-block) interleaved batch.
+    # In triple_mode the marker is injected only at marked-noisy positions
+    # (above), so the model produces independent predictions at marked vs
+    # unmarked noisy slots via the block-diagonal attention mask.
     with swap_attention_impl(model, "sdpa"), _no_gradient_checkpointing(model) as _n_gc:
         if _diag_once:
-            print(f"[cons-step] disabled GC on {_n_gc} submodules", flush=True)
+            print(f"[cons-step] disabled GC on {_n_gc} submodules; triple_mode={triple_mode}", flush=True)
         if inputs_embeds is not None:
             out = model(
                 inputs_embeds=inputs_embeds,
@@ -289,30 +400,43 @@ def compute_consistency_loss(
         print("[cons-step] post-model-forward sync ok", flush=True)
     logits = out.logits  # (B, Lmax, V)
 
-    b_idx, k_pos, l_pos = _identify_block_positions(batch)
+    if triple_mode:
+        b_idx, m_pos, u_pos, l_pos = _identify_block_positions_triple(batch)
+        # In triple mode, cons predictor lives at MARKED-noisy positions,
+        # anchor target reads from UNMARKED-noisy positions.
+        k_pos = m_pos
+    else:
+        b_idx, k_pos, l_pos = _identify_block_positions(batch)
+        u_pos = None
     if _diag_once:
         torch.cuda.synchronize()
         print(
-            f"[cons-step] post-identify n_pos={int(b_idx.numel())} "
-            f"b_idx.max={int(b_idx.max().item()) if b_idx.numel() else -1} "
+            f"[cons-step] post-identify triple_mode={triple_mode} n_pos={int(b_idx.numel())} "
             f"k_pos.max={int(k_pos.max().item()) if k_pos.numel() else -1} "
             f"l_pos.max={int(l_pos.max().item()) if l_pos.numel() else -1} "
+            f"u_pos.max={int(u_pos.max().item()) if (u_pos is not None and u_pos.numel()) else -1} "
             f"logits.shape={tuple(logits.shape)}",
             flush=True,
         )
     n_pos = int(b_idx.numel())
     if n_pos == 0:
         zero = logits.sum() * 0.0
-        return zero, {"cons_loss": 0.0, "cons_n_pairs": 0, "cons_n_pos": 0}
+        return zero, None, {"cons_loss": 0.0, "cons_n_pairs": 0, "cons_n_pos": 0}
 
-    student = logits[b_idx, k_pos, :]                 # (n_pos, V) — noisy view
+    student_noisy = logits[b_idx, k_pos, :]           # (n_pos, V) — cons predictor (marked-noisy in triple mode)
+    student_clean = logits[b_idx, l_pos, :]           # (n_pos, V) — clean-position predictions
 
     if teacher_model is None:
-        # Self-distillation: teacher = student's clean-view logits, detached.
-        teacher = logits[b_idx, l_pos, :].detach()
+        # Self-distillation: teacher = student's own clean-view logits.
+        # NOTE: when compute_anchor=True with teacher_model=None the anchor
+        # term is vacuous (KL(x || x.detach()) ≈ 0). The dual-KL only makes
+        # sense with an *external* teacher (EMA, base, frozen snapshot).
+        teacher_clean = logits[b_idx, l_pos, :].detach()
     else:
-        # Frozen external teacher (e.g. pre-RL base model): one no_grad forward
-        # on the SAME interleaved batch + mask. Take clean-position logits.
+        # External teacher (frozen base OR EMA student): one no_grad forward
+        # on the SAME interleaved batch + mask. Take clean-position logits
+        # as the target for BOTH cons (at noisy positions) and anchor (at
+        # clean positions).
         with torch.no_grad(), swap_attention_impl(teacher_model, "sdpa"):
             t_out = teacher_model(
                 input_ids=batch.input_ids,
@@ -320,17 +444,55 @@ def compute_consistency_loss(
                 attention_mask=sdpa_mask,
                 use_cache=False,
             )
-        teacher = t_out.logits[b_idx, l_pos, :].detach()
+        teacher_clean = t_out.logits[b_idx, l_pos, :].detach()
 
-    loss = soft_cross_entropy(student, teacher, T_soft=T_soft,
-                              divergence=divergence) * (T_soft * T_soft)
+    cons_loss = soft_cross_entropy(student_noisy, teacher_clean, T_soft=T_soft,
+                                   divergence=divergence) * (T_soft * T_soft)
+
+    anchor_loss = None
+    if compute_anchor:
+        if anchor_mode == "clean":
+            # Anchor at CLEAN positions: pull student's clean-position predictions
+            # toward teacher's clean-position predictions. Resists drift of AR-mode
+            # behavior on tokens we'd actually predict at inference.
+            anchor_loss = soft_cross_entropy(student_clean, teacher_clean, T_soft=T_soft,
+                                             divergence=divergence) * (T_soft * T_soft)
+        elif anchor_mode == "noisy_unmarked":
+            # Anchor at UNMARKED-NOISY positions (separate slot in the 3-block
+            # layout, sharing RoPE positions with the marked-noisy slot but
+            # masked off from it). Target = teacher's prediction at those
+            # same positions (teacher sees no marker either way).
+            # The marker becomes an explicit gating signal: with marker ->
+            # cons predictor pulls toward clean target; without marker ->
+            # the model's prediction stays near the teacher's noisy prediction.
+            if not triple_mode or u_pos is None:
+                # No 3-block layout active -> degenerate; anchor at clean (same as
+                # anchor_mode="clean") to avoid silent vacuous KL.
+                if teacher_model is None:
+                    teacher_clean_target = logits[b_idx, l_pos, :].detach()
+                else:
+                    teacher_clean_target = t_out.logits[b_idx, l_pos, :].detach()
+                anchor_loss = soft_cross_entropy(student_clean, teacher_clean_target,
+                                                 T_soft=T_soft, divergence=divergence) * (T_soft * T_soft)
+            else:
+                student_unmarked_noisy = logits[b_idx, u_pos, :]
+                if teacher_model is None:
+                    teacher_unmarked_noisy = logits[b_idx, u_pos, :].detach()
+                else:
+                    teacher_unmarked_noisy = t_out.logits[b_idx, u_pos, :].detach()
+                anchor_loss = soft_cross_entropy(student_unmarked_noisy, teacher_unmarked_noisy,
+                                                 T_soft=T_soft, divergence=divergence) * (T_soft * T_soft)
+        else:
+            raise ValueError(f"Unknown anchor_mode: {anchor_mode!r}; expected 'clean' or 'noisy_unmarked'.")
 
     metrics = {
-        "cons_loss": float(loss.detach().item()),
+        "cons_loss": float(cons_loss.detach().item()),
         "cons_n_pairs": int(batch.num_pairs.sum().item()),
         "cons_n_pos": n_pos,
     }
-    return loss, metrics
+    if anchor_loss is not None:
+        metrics["anchor_loss"] = float(anchor_loss.detach().item())
+    return cons_loss, anchor_loss, metrics
 
 
 if __name__ == "__main__":
