@@ -62,6 +62,12 @@ def compute_score(solution_str, ground_truth, method="strict", format_score=0.0,
         format_score: the score for the format
         score: the score for the correct answer
     """
+    # Math-trained models (e.g. JacobiForcing_Math_7B_v1) emit `\boxed{...}` rather
+    # than the GSM8K-canonical `#### N`. Delegate to the MATH reward extractor in
+    # that case — it correctly handles nested braces, LaTeX, and integer answers.
+    if "\\boxed{" in solution_str:
+        from . import math_reward
+        return math_reward.compute_score(solution_str, ground_truth)
     answer = extract_solution(solution_str=solution_str, method=method)
     if answer is None:
         return 0
