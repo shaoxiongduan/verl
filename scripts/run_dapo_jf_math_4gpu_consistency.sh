@@ -1,85 +1,42 @@
 #!/usr/bin/env bash
-# DAPO RL training of JacobiForcing_Coder_7B_v1 on OpenCodeInstruct.
-# 4 H200 GPUs, FSDP2 colocated rollout. Single-turn coder RL.
-#
-# Companion files (must exist):
-#   scripts/data_preprocess/opencodeinstruct.py  -> data/opencodeinstruct/{train,val}.parquet
-#   scripts/data_preprocess/humanevalplus.py     -> data/humanevalplus/val.parquet
-#   scripts/reward_code_assert.py                -> custom compute_score_batch
-#
-# Differences from scripts/run_dapo_jf_4gpu.sh (math):
-#   - model -> JacobiForcing_Coder_7B_v1
-#   - dataset -> OpenCodeInstruct (in-distribution with JF paper) + HumanEval+ eval
-#   - reward fn: math_dapo -> custom assert-style executor (scripts/reward_code_assert.py)
-#     (DAPO reward manager kept; experimental loop calls compute_score via
-#      asyncio.run_in_executor, so per-sample fn is already parallelized.)
-#   - max_response_length: 2k -> 4k
-#   - val_kwargs.n=8 for pass@k signal on HumanEval+
-#   - gen_prompt_bsz oversample raised 64->96 (code prompts get filtered more)
-#   - gpu_mem_util 0.55 -> 0.50 (longer KV at 4k resp)
+# DAPO RL training of JacobiForcing_Math_7B_v1 on OpenMathInstruct-2 (math)
+# with cons-loss hook. 4 H200 GPUs, FSDP2 colocated rollout. Mirrors
+# run_dapo_jf_coder_4gpu_consistency.sh but with the math model + math data +
+# DAPO math reward (built-in, no custom reward fn).
 set -xeuo pipefail
 
 cd /mnt/weka/home/hao.zhang/shao/verl
 source .venv/bin/activate
 
-project_name=${PROJECT_NAME:-jacobi_forcing_dapo_opencodeinstruct}
-exp_name=${EXP_NAME:-jf_coder_7b_dapo_oci_4gpu_consistency}
+project_name=${PROJECT_NAME:-jacobi_forcing_dapo_openmathinstruct2}
+exp_name=${EXP_NAME:-jf_math_7b_dapo_omi_4gpu_consistency}
 
 # Consistency loss config — read by scripts/consistency/verl_hook.py via env.
-# Standard AR path is unaffected when CONSISTENCY_ENABLE=0 (or unset).
 export CONSISTENCY_ENABLE=${CONSISTENCY_ENABLE:-1}
 export CONSISTENCY_WEIGHT=${CONSISTENCY_WEIGHT:-0.01}
 export CONSISTENCY_BLOCK_SIZE=${CONSISTENCY_BLOCK_SIZE:-32}
 export CONSISTENCY_T_SOFT=${CONSISTENCY_T_SOFT:-1.0}
-export CONSISTENCY_FRACTION=${CONSISTENCY_FRACTION:-0.10}   # ~50 of 512 prompts
-export CONSISTENCY_MAX_PAIRS=${CONSISTENCY_MAX_PAIRS:-16}   # caps Lmax ~ P+2*16*32 = 3k
+export CONSISTENCY_FRACTION=${CONSISTENCY_FRACTION:-0.10}
+export CONSISTENCY_MAX_PAIRS=${CONSISTENCY_MAX_PAIRS:-16}
 export CONSISTENCY_PAD_ID=${CONSISTENCY_PAD_ID:-151643}     # Qwen2.5 <|endoftext|>
-export CONSISTENCY_DEBUG=${CONSISTENCY_DEBUG:-1}            # diagnostic prints
+export CONSISTENCY_DEBUG=${CONSISTENCY_DEBUG:-1}
 
-# Bidirectional-Jacobi training: hybrid causal+bidirectional attention inside
-# the noisy (draft) block.
-#   0  (default) : pure causal noisy block — original training recipe, bit-identical.
-#   N  (0 < N < CONSISTENCY_BLOCK_SIZE) : first N positions causal (AR-equivalent,
-#       committable at inference); remaining (BLOCK_SIZE - N) positions bidirectional
-#       within the noisy block (refinement context).
-# Inference must use the SAME causal_region_size (jacobi_causal_region_size in
-# nanovllm SamplingParams) for the trained model to behave correctly at decode time.
-# Recommended starting value: 16 (matches 16+16 split that ties causal baseline
-# on math without training; trains the bidir region to actually contribute).
 export CONSISTENCY_CAUSAL_REGION_SIZE=${CONSISTENCY_CAUSAL_REGION_SIZE:-0}
-
-# Weight scheduling. "constant" (default) holds CONSISTENCY_WEIGHT for all
-# steps. "warmup_in" ramps 0 → CONSISTENCY_WEIGHT; "warmup_out" ramps
-# CONSISTENCY_WEIGHT → 0 over [RAMP_START_FRAC, RAMP_END_FRAC] of total_steps.
-# `actor/cons_weight_effective` is logged to wandb each step.
-#
-# Example launch overrides:
-#   warmup_out (cons strong early, fades out by mid-training):
-#     CONSISTENCY_SCHEDULE=warmup_out CONSISTENCY_WEIGHT=0.005 \
-#     CONSISTENCY_RAMP_START_FRAC=0.0 CONSISTENCY_RAMP_END_FRAC=0.5 \
-#     bash scripts/run_dapo_jf_coder_4gpu_consistency.sh
-#   warmup_in (cons starts at zero, ramps in mid-training to fine-tune TPF):
-#     CONSISTENCY_SCHEDULE=warmup_in CONSISTENCY_WEIGHT=0.001 \
-#     CONSISTENCY_RAMP_START_FRAC=0.5 CONSISTENCY_RAMP_END_FRAC=0.8 \
-#     bash scripts/run_dapo_jf_coder_4gpu_consistency.sh
 export CONSISTENCY_SCHEDULE=${CONSISTENCY_SCHEDULE:-constant}
 export CONSISTENCY_RAMP_START_FRAC=${CONSISTENCY_RAMP_START_FRAC:-0.0}
 export CONSISTENCY_RAMP_END_FRAC=${CONSISTENCY_RAMP_END_FRAC:-1.0}
-# CONSISTENCY_WEIGHT_FINAL is optional; if set, overrides the schedule preset
-# and goes CONSISTENCY_WEIGHT → CONSISTENCY_WEIGHT_FINAL over the ramp window.
 
-# Total training steps — kept in sync with trainer.total_training_steps so the
-# schedule progress fraction is computed correctly.
 total_training_steps=${TOTAL_TRAINING_STEPS:-300}
 export CONSISTENCY_TOTAL_STEPS=${CONSISTENCY_TOTAL_STEPS:-${total_training_steps}}
 
-JF_MODEL=${JF_MODEL:-/mnt/weka/home/hao.zhang/.cache/huggingface/hub/models--JacobiForcing--JacobiForcing_Coder_7B_v1/snapshots/81815b050f535c622153b5f6df38efc71326f938}
+JF_MODEL=${JF_MODEL:-/mnt/weka/home/hao.zhang/.cache/huggingface/hub/models--JacobiForcing--JacobiForcing_Math_7B_v1/snapshots/e65283c1b3d205b23c2bdf9946158035c409d3a1}
 
-TRAIN_FILE=${TRAIN_FILE:-/mnt/weka/home/hao.zhang/shao/verl/data/opencodeinstruct/train.parquet}
-VAL_FILE=${VAL_FILE:-/mnt/weka/home/hao.zhang/shao/verl/data/humanevalplus/val.parquet}
+TRAIN_FILE=${TRAIN_FILE:-/mnt/weka/home/hao.zhang/shao/verl/data/deepscaler/train.parquet}
+# Multi-source val: MATH-lighteval (512 problems) + GSM8K (1319 problems).
+# verl will log per-data_source metrics: val-core/DigitalLearningGmbH/MATH-lighteval/...
+# and val-core/openai/gsm8k/... separately.
+VAL_FILES_LIST=${VAL_FILES_LIST:-'[/mnt/weka/home/hao.zhang/shao/verl/data/openmathinstruct2/val.parquet,/mnt/weka/home/hao.zhang/shao/verl/data/gsm8k/test.parquet]'}
 CKPT_DIR=${CKPT_DIR:-/mnt/weka/home/hao.zhang/shao/verl/ckpts/${project_name}/${exp_name}}
-
-REWARD_FN=/mnt/weka/home/hao.zhang/shao/verl/scripts/reward_code_assert.py
 
 NNODES=${NNODES:-1}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-4}
@@ -93,10 +50,11 @@ kl_loss_coef=0.0
 clip_ratio_low=0.2
 clip_ratio_high=0.28
 
-# Lengths
+# Lengths (math: 2k + 2k like deepscaler launcher; shorter than code)
 max_prompt_length=$((1024 * 2))
-max_response_length=$((1024 * 4))
-overlong_buffer_len=1024
+max_response_length=$((1024 * 2))
+enable_overlong_buffer=True
+overlong_buffer_len=512
 overlong_penalty_factor=1.0
 
 # Sampling
@@ -104,13 +62,13 @@ temperature=1.0
 top_p=1.0
 top_k=-1
 val_top_p=0.7
-val_n=8                         # pass@k signal on HumanEval+
+val_n=${VAL_N:-4}                  # pass@k signal; reduced from 8 because we eval 1831 prompts (MATH+GSM8K)
 
 # Batch shape
 train_prompt_bsz=32
 n_resp_per_prompt=16
 train_prompt_mini_bsz=32
-gen_prompt_bsz_oversample=96    # more headroom for code's heavier all-pass/all-fail filter
+gen_prompt_bsz_oversample=64
 
 # Memory / sharding
 use_dynamic_bsz=True
@@ -122,17 +80,7 @@ fsdp_size=4
 actor_offload=True
 ref_offload=True
 loss_agg_mode="token-mean"
-gpu_mem_util=0.50
-
-# Reward execution
-reward_timeout_s=10
-# memory_mb is intentionally left unset — RLIMIT_AS conflicts with numpy/torch
-# shared libraries. Wallclock timeout is the real safety net. Set explicitly
-# (e.g. reward_memory_mb=4096) only if subprocesses are OOMing the host.
-
-# DAPO overlong-buffer reward shaping (same shape as math run).
-enable_overlong_buffer=True
-overlong_penalty_log=False
+gpu_mem_util=0.55
 
 # Logger
 export WANDB_API_KEY=${WANDB_API_KEY:-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}
@@ -146,7 +94,7 @@ fi
 
 python3 -m verl.trainer.main_ppo \
     data.train_files="${TRAIN_FILE}" \
-    data.val_files="${VAL_FILE}" \
+    data.val_files=${VAL_FILES_LIST} \
     data.prompt_key=prompt \
     data.truncation='left' \
     data.dataloader_num_workers=0 \
@@ -204,13 +152,10 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size} \
     actor_rollout_ref.actor.fsdp_config.fsdp_size=${fsdp_size} \
     reward.reward_manager.name=dapo \
-    reward.custom_reward_function.path="${REWARD_FN}" \
-    reward.custom_reward_function.name=compute_score \
-    +reward.custom_reward_function.reward_kwargs.timeout_s=${reward_timeout_s} \
     +reward.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \
     +reward.reward_kwargs.overlong_buffer_cfg.len=${overlong_buffer_len} \
     +reward.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor} \
-    +reward.reward_kwargs.overlong_buffer_cfg.log=${overlong_penalty_log} \
+    +reward.reward_kwargs.overlong_buffer_cfg.log=False \
     +reward.reward_kwargs.max_resp_len=${max_response_length} \
     trainer.logger="${LOGGER}" \
     trainer.project_name="${project_name}" \
@@ -220,8 +165,8 @@ python3 -m verl.trainer.main_ppo \
     trainer.val_before_train=True \
     trainer.test_freq=20 \
     trainer.save_freq=20 \
-    trainer.max_actor_ckpt_to_keep=${MAX_ACTOR_CKPT:-3} \
-    trainer.total_epochs=1 \
+    trainer.max_actor_ckpt_to_keep=${MAX_ACTOR_CKPT:-5} \
+    trainer.total_epochs=${TOTAL_EPOCHS:-4} \
     trainer.total_training_steps=${total_training_steps} \
     trainer.default_local_dir="${CKPT_DIR}" \
     trainer.resume_mode=auto \

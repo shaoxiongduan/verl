@@ -32,6 +32,8 @@ def make_mask_mod(
     block_lens: torch.Tensor,
     pad_mask: torch.Tensor,
     triple_mode: bool = False,
+    causal_region_size: int = 0,
+    num_noisy_tiles: int = 1,
 ):
     """Build a mask_mod closure with batched per-sample metadata baked in.
     Returns a callable `(b, h, q, k) -> bool` (broadcastable).
@@ -42,11 +44,33 @@ def make_mask_mod(
       Triple j has 3 sub-blocks; block_idx_q % 3 == 0 → marked-noisy,
       == 1 → unmarked-noisy, == 2 → clean. marked and unmarked do NOT attend
       to each other (they share RoPE positions but are independent slots).
+
+    causal_region_size: hybrid AR/bidirectional mask inside each noisy block
+      (the draft block being trained for parallel decoding consistency).
+        0  (default) : pure causal within the noisy block — current behavior,
+                       bit-identical to the original training recipe.
+        N  (0 < N < block_len) : the first N intra-block positions remain causal
+                       (AR-equivalent verification region), and the remaining
+                       (block_len - N) positions attend bidirectionally to the
+                       entire noisy block. Matches the TiDAR-style structured
+                       mask used in inference; only the first N positions get
+                       committed at decode time so AR-equivalence is preserved.
+        -1 : FULLY BIDIRECTIONAL — every position in the noisy block attends
+             to every other position in the same noisy block (no causal
+             constraint). Matches dFlash / Fast-dLLM v2 within-block attention.
+             AR-equivalence is lost; only use when AR equivalence isn't needed.
+        N >= block_len : effectively pure causal (no positions in bidir region).
     """
     P_t = prompt_lens
     T_t = num_pairs
     N_t = torch.clamp(block_lens, min=1)
     V_t = pad_mask
+    cr = int(causal_region_size)
+    full_bidir = cr < 0
+    hybrid_mask = cr > 0  # if 0 or -1, the per-q-position causal split isn't needed
+    K = int(num_noisy_tiles)
+    assert K >= 1, f"num_noisy_tiles must be >= 1, got {K}"
+    G = K + 1  # tiles per block-group: K noisy + 1 clean
 
     if not triple_mode:
         def mask_mod(b, h, q, k):
@@ -65,23 +89,39 @@ def make_mask_mod(
             block_idx_q = torch.div(rel_q, N, rounding_mode="floor")
             block_idx_k = torch.div(rel_k, N, rounding_mode="floor")
 
-            is_noisy_q = (~is_prompt_q) & (block_idx_q % 2 == 0)
-            is_clean_q = (~is_prompt_q) & (block_idx_q % 2 == 1)
-            is_noisy_k = (~is_prompt_k) & (block_idx_k % 2 == 0)
-            is_clean_k = (~is_prompt_k) & (block_idx_k % 2 == 1)
+            # Sub-block role: 0..K-1 = noisy tiles, K = clean.
+            sub_q = block_idx_q % G
+            sub_k = block_idx_k % G
+            is_noisy_q = (~is_prompt_q) & (sub_q < K)
+            is_clean_q = (~is_prompt_q) & (sub_q == K)
+            is_noisy_k = (~is_prompt_k) & (sub_k < K)
+            is_clean_k = (~is_prompt_k) & (sub_k == K)
 
             Tmax = torch.maximum(T - 1, torch.zeros_like(T))
-            j_q_unc = block_idx_q // 2
+            j_q_unc = block_idx_q // G
             j_q = torch.minimum(torch.maximum(j_q_unc, torch.zeros_like(j_q_unc)), Tmax)
 
-            ks_ = p + 2 * j_q * N
-            ls_ = p + (2 * j_q + 1) * N
+            # Q's own tile start (one of K noisy tiles) and the clean tile of its group.
+            ks_ = p + G * j_q * N + sub_q * N        # start of q's own noisy tile (valid only when q is noisy)
+            ls_ = p + (G * j_q + K) * N              # start of q's group's clean tile
 
-            clean_in_prev_clean = is_clean_k & (block_idx_k < 2 * j_q)
-            same_noisy_block = is_noisy_q & is_noisy_k & (block_idx_q == block_idx_k)
+            # Previous CLEAN tiles are at sub_k == K with block_idx_k < G*j_q.
+            clean_in_prev_clean = is_clean_k & (block_idx_k < G * j_q)
+            # Sibling noisy tiles in same group must NOT see each other:
+            # require same block_idx (not just same group) for noisy↔noisy.
+            same_noisy_tile = is_noisy_q & is_noisy_k & (block_idx_q == block_idx_k)
             same_clean_block = is_clean_q & is_clean_k & (block_idx_q == block_idx_k)
 
-            same_noisy_attn = same_noisy_block & (k >= ks_) & (k <= q)
+            if hybrid_mask:
+                q_in_block = q - ks_
+                q_in_causal = q_in_block < cr
+                same_noisy_attn = same_noisy_tile & (k >= ks_) & (
+                    (q_in_causal & (k <= q)) | (~q_in_causal)
+                )
+            elif full_bidir:
+                same_noisy_attn = same_noisy_tile & (k >= ks_)
+            else:
+                same_noisy_attn = same_noisy_tile & (k >= ks_) & (k <= q)
 
             mask_noisy = is_noisy_q & (is_prompt_k | clean_in_prev_clean | same_noisy_attn)
             mask_clean = is_clean_q & (
@@ -135,10 +175,26 @@ def make_mask_mod(
         same_unmarked = is_unmarked_q & is_unmarked_k & same_triple
         same_clean = is_clean_q & is_clean_k & same_triple
 
-        # Jacobi-style intra-block attention for noisy slots; causal within block.
-        same_marked_attn = same_marked & (k >= ms_) & (k <= q)
-        same_unmarked_attn = same_unmarked & (k >= us_) & (k <= q)
-        # Causal within the clean block.
+        if hybrid_mask:
+            # Hybrid causal + bidirectional inside both noisy sub-blocks
+            # (marked and unmarked). First `cr` intra-block positions are
+            # causal; the rest are bidirectional within the same sub-block.
+            q_in_marked = q - ms_
+            q_in_unmarked = q - us_
+            q_in_causal_m = q_in_marked < cr
+            q_in_causal_u = q_in_unmarked < cr
+            same_marked_attn = same_marked & (k >= ms_) & (
+                (q_in_causal_m & (k <= q)) | (~q_in_causal_m)
+            )
+            same_unmarked_attn = same_unmarked & (k >= us_) & (
+                (q_in_causal_u & (k <= q)) | (~q_in_causal_u)
+            )
+        else:
+            # Jacobi-style intra-block attention for noisy slots; causal within block.
+            same_marked_attn = same_marked & (k >= ms_) & (k <= q)
+            same_unmarked_attn = same_unmarked & (k >= us_) & (k <= q)
+        # Causal within the clean block (always causal — these are the
+        # AR-target supervision positions and must remain AR-faithful).
         same_clean_attn = same_clean & (k >= ls_) & (k <= q)
 
         mask_marked = is_marked_q & (
@@ -164,13 +220,22 @@ def build_sdpa_attention_mask(
     device,
     dtype=torch.float32,
     triple_mode: bool = False,
+    causal_region_size: int = 0,
+    num_noisy_tiles: int = 1,
 ) -> torch.Tensor:
     """Materialize the boolean attention pattern into a (B, 1, Lmax, Lmax)
     additive float mask. 0.0 = allowed, -inf = blocked. SDPA broadcasts
     over the head dimension.
+
+    `causal_region_size`: see make_mask_mod docstring. 0 = pure causal
+    (default; bit-identical to original training recipe).
     """
     B, Lmax = pad_mask.shape
-    fn = make_mask_mod(prompt_lens, num_pairs, block_lens, pad_mask, triple_mode=triple_mode)
+    fn = make_mask_mod(
+        prompt_lens, num_pairs, block_lens, pad_mask,
+        triple_mode=triple_mode, causal_region_size=causal_region_size,
+        num_noisy_tiles=num_noisy_tiles,
+    )
 
     b_idx = torch.arange(B, device=device).view(B, 1, 1).expand(B, Lmax, Lmax)
     h_idx = torch.zeros((1,), dtype=torch.long, device=device)  # broadcastable
@@ -227,13 +292,20 @@ if __name__ == "__main__":
     # Self-test: directly evaluate mask_mod on a small grid + visualize.
     P = torch.tensor([2])
     T = torch.tensor([2])
-    N = torch.tensor([3])
+    N = torch.tensor([4])
     Lmax = int((P + 2 * T * N).item())
     pad = torch.ones((1, Lmax), dtype=torch.bool)
-    add_mask = build_sdpa_attention_mask(P, T, N, pad, device="cpu", dtype=torch.float32)
-    print(f"SDPA additive mask shape: {tuple(add_mask.shape)}  (Lmax={Lmax})")
-    bool_view = add_mask[0, 0] >= -1e30  # True = allowed
-    print("Layout: prompt(2) | k_0(3) last_0(3) | k_1(3) last_1(3)")
-    print("rows = query, cols = key. '#' = attend, '.' = blocked")
-    for i in range(Lmax):
-        print(f"  q={i:2d}  " + "".join("#" if bool_view[i, j] else "." for j in range(Lmax)))
+
+    def show(cr, label):
+        add_mask = build_sdpa_attention_mask(
+            P, T, N, pad, device="cpu", dtype=torch.float32, causal_region_size=cr,
+        )
+        bool_view = add_mask[0, 0] >= -1e30
+        print(f"\n=== {label} (causal_region_size={cr}) ===")
+        print("Layout: prompt(2) | k_0(4) last_0(4) | k_1(4) last_1(4)")
+        for i in range(Lmax):
+            print(f"  q={i:2d}  " + "".join("#" if bool_view[i, j] else "." for j in range(Lmax)))
+
+    show(0, "default — pure causal noisy block (original behavior)")
+    show(2, "hybrid 2+2 — first 2 noisy positions causal, last 2 bidirectional")
+    show(4, "cr == N — effectively pure causal (degenerate)")
