@@ -92,6 +92,12 @@ _TR_CURRENT_STEP_PG_SUM = 0.0
 _TR_CURRENT_STEP_CONS_SUM = 0.0
 _TR_PREV_STEP_PG_ABS = None    # |signed Σ pg_per_mb| over previous step (EMA or raw)
 _TR_PREV_STEP_CONS = None      # Σ |cons_loss_norm_per_mb| over previous step (EMA or raw)
+# Diagnostics for target_lambda mechanism: PG sum-of-abs is the "true" PG magnitude
+# at per-MB granularity; comparing it to abs-of-sum reveals MB cancellation.
+_TR_CURRENT_STEP_PG_ABS_SUM = 0.0  # Σ |pg_loss_per_mb| (no sign cancellation)
+_TR_PREV_STEP_PG_ABS_SUM = None
+_TR_CURRENT_STEP_CONS_EFF_SUM = 0.0  # Σ |cons_loss_effective_per_mb| = Σ |weight * cons_norm|
+_TR_PREV_STEP_CONS_EFF_SUM = None
 
 
 def _get_marker_embed_from_disk(model_path: str, marker_id: int, device, dtype):
@@ -307,6 +313,141 @@ def _dump_micro_batch_structure(micro_batch) -> None:
             print(f"[consistency-diag]  {k!r}: type={type(v).__name__} value={v!r}"[:200], flush=True)
 
 
+def _extract_request_ids(micro_batch, B: int) -> list[str] | None:
+    """Recover the per-sample vLLM request_id (set by SingleTurnAgentLoop).
+
+    Returns a list of length B, or None if no request_ids are present
+    (e.g., legacy rollout path without jacobi_request_id in extra_fields).
+
+    Mirrors `_extract_per_sample_acc`: directly index micro_batch[key]; use
+    `.data` to unwrap NonTensorData wrappers.
+    """
+    try:
+        raw = micro_batch["jacobi_request_id"]
+    except (KeyError, IndexError, TypeError):
+        return None
+    if raw is None:
+        return None
+    out: list[str] = []
+    try:
+        for i in range(B):
+            v = raw[i]
+            if hasattr(v, "data"):
+                v = v.data
+            if v is None:
+                return None
+            out.append(str(v))
+    except Exception:
+        return None
+    return out
+
+
+def _load_cascade_drafts_from_micro_batch(
+    micro_batch,
+    response_lens: list[int],
+    block_size: int,
+    original_indices: list[int] | None = None,
+    debug: bool = False,
+) -> list[list[tuple[int, int, tuple]]] | None:
+    """Pull on-policy cascade trajectories DIRECTLY from `micro_batch`'s
+    `jacobi_trajectories` non-tensor field and convert to disjoint
+    (start, end, draft) tuples per sample.
+
+    The vllm_async_server stuffs per-request trajectory records into
+    `TokenOutput.extra_fields["jacobi_trajectories"]` after each rollout. These
+    propagate through SingleTurnAgentLoop → AgentLoopOutput.extra_fields → the
+    agent-loop _postprocess aggregator → DataProto.non_tensor_batch → micro_batch.
+
+    No file I/O on the cons-hook side; no global JSONL parsing every cons call.
+
+    Returns:
+      - list of per-sample disjoint trajectories (empty list for samples with
+        no on-policy data)
+      - or None if the field is missing entirely (caller falls back to uniform).
+    """
+    B = len(response_lens)
+    try:
+        raw = micro_batch["jacobi_trajectories"]
+    except (KeyError, IndexError, TypeError):
+        return None
+    if raw is None:
+        return None
+
+    # Lazy import to avoid loading paths at module import time.
+    try:
+        import sys as _sys
+        _scripts_dir = os.path.dirname(os.path.dirname(__file__))
+        if _scripts_dir not in _sys.path:
+            _sys.path.insert(0, _scripts_dir)
+        from consistency.trajectory_loader import parse_per_request_records
+        from consistency.onpolicy_select import greedy_non_overlapping
+    except ImportError as e:
+        print(f"[cons-onpolicy] failed to import parsers: {e}", flush=True)
+        return None
+
+    out: list[list[tuple[int, int, tuple]]] = []
+    all_lists: list[list] = []  # parallel: all trajectories per sample (for alt pools)
+    n_matched = 0
+    n_total_picks = 0
+    # `i` indexes the cons-batch (post correct_only filter + fraction subsample).
+    # `raw` and other micro_batch fields are indexed by the ORIGINAL pre-filter
+    # micro_batch sample id. `original_indices[i]` gives the original sample id
+    # corresponding to cons-batch slot i. Without this mapping the loader pairs
+    # sample X's trajectories with sample Y's response — silent training noise.
+    # 2026-06-04: this was a pre-existing bug that newly surfaced when the
+    # mask gap fix made the (X-draft, Y-response) incoherence visible to the
+    # cons forward via bridge tokens.
+    if original_indices is None:
+        original_indices = list(range(B))
+    assert len(original_indices) == B, (
+        f"original_indices length ({len(original_indices)}) must equal "
+        f"cons-batch size ({B})"
+    )
+    for i in range(B):
+        orig_i = int(original_indices[i])
+        recs = raw[orig_i]
+        if hasattr(recs, "data"):
+            recs = recs.data
+        if not recs:
+            out.append([])
+            all_lists.append([])
+            continue
+        trajs = parse_per_request_records(recs)
+        # Filter by length == block_size (uniform K assumption — vLLM K must
+        # equal pack block_size for on-policy alignment; the launcher checks).
+        trajs_n = [t for t in trajs if t.length == block_size]
+        if not trajs_n:
+            out.append([])
+            all_lists.append([])
+            continue
+        sel = greedy_non_overlapping(trajs_n, response_len=response_lens[i])
+        out.append(list(sel))
+        # Side channel: also stash the FULL trajectory list for this sample
+        # so the alt-pool builder in pack.py can read all candidates.
+        all_lists.append(list(trajs_n))
+        if sel:
+            n_matched += 1
+            n_total_picks += len(sel)
+    if debug:
+        print(
+            f"[cons-onpolicy] matched {n_matched}/{B} samples; "
+            f"avg picks per matched = "
+            f"{n_total_picks / max(1, n_matched):.1f}",
+            flush=True,
+        )
+    if n_matched == 0:
+        return None
+    return _ConsDraftListWithAll(out, all_lists)
+
+
+class _ConsDraftListWithAll(list):
+    """List subclass that carries a parallel `all_trajs` attribute (full traj
+    list per sample, in addition to the selected non-overlapping subset)."""
+    def __init__(self, selected_per_sample, all_per_sample):
+        super().__init__(selected_per_sample)
+        self.all_trajs = all_per_sample
+
+
 def _extract_prompts_responses(micro_batch) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     """Recover the (prompt_ids[i], response_ids[i]) lists from verl's batch.
 
@@ -344,6 +485,45 @@ def _extract_prompts_responses(micro_batch) -> tuple[list[torch.Tensor], list[to
         prompt_list.append(prompts[i][p_mask[i]].long().cpu())
         resp_list.append(responses[i][r_mask[i]].long().cpu())
     return prompt_list, resp_list
+
+
+def _has_token_repetition(
+    token_ids: list[int],
+    tail_n: int = 200,
+    ngram_lens: tuple[int, ...] = (10, 20, 40),
+    min_repeats: int = 3,
+    step: int = 2,
+) -> bool:
+    """Token-level degenerate-loop detector. Flags `True` iff some n-gram
+    (of any length in `ngram_lens`) repeats `min_repeats`+ times within the
+    last `tail_n` tokens of `token_ids`.
+
+    Why token-level (not decoded text): avoids the tokenizer round-trip in
+    the hot training loop. The thresholds (10/20/40 tokens × 3) catch the
+    same degenerate "To solve the problem ... To solve the problem ..."
+    loops that the 30/50/80-char text detector at
+    `eval_passk/tpf_results/_check_v4_repetition` flags, without being
+    fooled by legitimate math markup that repeats short tokens like `}`.
+
+    Cost: O(tail_n / step * len(ngram_lens)) hashes per response. Negligible
+    next to the cons forward pass.
+    """
+    if not token_ids:
+        return False
+    n_full = len(token_ids)
+    s = token_ids[-tail_n:] if n_full > tail_n else token_ids
+    n = len(s)
+    for L in ngram_lens:
+        if L * min_repeats > n:
+            continue
+        seen: dict[tuple, int] = {}
+        for i in range(0, n - L + 1, step):
+            sub = tuple(s[i : i + L])
+            c = seen.get(sub, 0) + 1
+            seen[sub] = c
+            if c >= min_repeats:
+                return True
+    return False
 
 
 def _extract_per_sample_acc(micro_batch, B: int) -> torch.Tensor:
@@ -514,6 +694,67 @@ def maybe_add_consistency_loss(
     if B == 0:
         return loss
 
+    # Rollout TPF logging. The Jacobi spec-decode engine writes per-iter
+    # (num_draft, n_acc) records into micro_batch["jacobi_trajectories"]; we
+    # aggregate them here so wandb gets per-step rollout/jacobi_tpf_* metrics.
+    # Emit both all-rollout and correct-only splits so we can see whether
+    # the correct trajectories spec-decode differently from the wrong ones.
+    if metrics is not None:
+        try:
+            raw_trajs = micro_batch["jacobi_trajectories"]
+        except (KeyError, IndexError, TypeError):
+            raw_trajs = None
+        if raw_trajs is not None:
+            # Pre-extract acc vector for the correct-only split. Mirrors the
+            # filter logic below but runs unconditionally for the metric.
+            try:
+                acc_vec_tpf = _extract_per_sample_acc(micro_batch, B)
+                correct_thr_tpf = _read("correct_threshold", 1.0, float)
+            except Exception:  # noqa: BLE001
+                acc_vec_tpf = None
+                correct_thr_tpf = 1.0
+            # Per-request stats (req_tok, req_iters, is_correct).
+            per_req_stats: list[tuple[int, int, bool]] = []
+            for idx, recs in enumerate(raw_trajs):
+                if hasattr(recs, "data"):
+                    recs = recs.data
+                if not recs:
+                    continue
+                req_tok = 0
+                req_iters = 0
+                for rec in recs:
+                    try:
+                        n_acc = int(rec["n_acc"])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    # Each spec iter commits n_acc accepted + 1 bonus token.
+                    req_tok += n_acc + 1
+                    req_iters += 1
+                if req_iters > 0:
+                    is_correct = False
+                    if acc_vec_tpf is not None and idx < len(acc_vec_tpf):
+                        try:
+                            is_correct = bool(float(acc_vec_tpf[idx]) >= correct_thr_tpf)
+                        except Exception:  # noqa: BLE001
+                            is_correct = False
+                    per_req_stats.append((req_tok, req_iters, is_correct))
+
+            def _emit(prefix: str, stats: list[tuple[int, int, bool]]) -> None:
+                if not stats:
+                    return
+                tot_tok = sum(s[0] for s in stats)
+                tot_iters = sum(s[1] for s in stats)
+                n_req = len(stats)
+                per_req_tpf = [s[0] / s[1] for s in stats]
+                metrics[f"{prefix}/jacobi_tpf_mean"] = float(sum(per_req_tpf) / len(per_req_tpf))
+                metrics[f"{prefix}/jacobi_tpf_agg"] = float(tot_tok / tot_iters)
+                metrics[f"{prefix}/jacobi_tok_per_req"] = float(tot_tok / n_req)
+                metrics[f"{prefix}/jacobi_iters_per_req"] = float(tot_iters / n_req)
+                metrics[f"{prefix}/jacobi_n_requests"] = int(n_req)
+
+            _emit("rollout", per_req_stats)
+            _emit("rollout_correct", [s for s in per_req_stats if s[2]])
+
     # Optional correct-only filter. When CONSISTENCY_CORRECT_ONLY=1, restrict
     # the cons-loss pool to samples whose binary correctness `acc` meets
     # CONSISTENCY_CORRECT_THRESHOLD (default 1.0). The fraction subsample
@@ -532,6 +773,13 @@ def maybe_add_consistency_loss(
     # forward runs and FSDP collectives stay symmetric across DP ranks) and
     # set this rank's local cons weight to 0 — gradient contribution is zero,
     # so the empty rank effectively abstains while collectives still fire.
+    # Track ORIGINAL micro_batch sample id for each (filtered, subsampled) slot.
+    # Without this, `_load_cascade_drafts_from_micro_batch` would read raw[i]
+    # for the i-th cons-batch slot but raw is indexed by ORIGINAL sample id —
+    # which mismatches after correct_only filter + fraction subsample, pairing
+    # sample X's trajectories with sample Y's response. Pre-existing bug,
+    # surfaced via the mask gap fix's bridge tokens (2026-06-04).
+    original_idx_list: list[int] = list(range(B))
     correct_only = _read("correct_only", False, lambda v: str(v).lower() in {"1", "true", "yes"})
     correct_threshold = _read("correct_threshold", 1.0, float)
     if correct_only:
@@ -546,12 +794,58 @@ def maybe_add_consistency_loss(
             # placeholder and zero out this rank's cons weight.
             prompt_list = [prompt_list[0]]
             response_list = [response_list[0]]
+            original_idx_list = [0]
             B = 1
             weight = 0.0
         else:
             prompt_list = [prompt_list[i] for i in correct_idx]
             response_list = [response_list[i] for i in correct_idx]
+            original_idx_list = [int(i) for i in correct_idx]
             B = n_correct
+
+    # Optional repetition filter. When CONSISTENCY_REPETITION_FILTER=1, drop
+    # trajectories whose response token-sequence contains a degenerate loop
+    # (n-gram repeating 3+ times in the tail). Rationale: training the cons
+    # loss on repetitive responses teaches the model to predict CLEANLY ON
+    # NOISE → REPETITION at the noise positions, which reinforces the
+    # repetition behavior at inference time. This filter applies to the cons
+    # loss POOL ONLY — DAPO reward & PG gradient are unchanged so the policy
+    # still receives the normal signal on repetitive prompts (typically a
+    # negative-reward signal from the math reward, which already discourages
+    # them).
+    #
+    # As with the correct_only filter, we keep a placeholder sample on empty
+    # pools to avoid NCCL deadlocks across DP ranks.
+    rep_filter = _read("repetition_filter", False,
+                       lambda v: str(v).lower() in {"1", "true", "yes"})
+    if rep_filter and B > 0:
+        rep_tail_n = _read("repetition_tail_n", 200, int)
+        rep_min_repeats = _read("repetition_min_repeats", 3, int)
+        non_rep_idx: list[int] = []
+        for i in range(B):
+            ids = response_list[i].tolist() if hasattr(response_list[i], "tolist") \
+                  else list(response_list[i])
+            if not _has_token_repetition(ids, tail_n=rep_tail_n,
+                                          min_repeats=rep_min_repeats):
+                non_rep_idx.append(i)
+        n_clean = len(non_rep_idx)
+        n_dropped = B - n_clean
+        if metrics is not None:
+            metrics["actor/cons_n_repetitive_dropped"] = int(n_dropped)
+            metrics["actor/cons_n_after_repfilter"] = int(n_clean)
+            metrics["actor/cons_repetition_fraction"] = float(n_dropped) / float(max(1, B))
+        if n_clean == 0:
+            # Empty pool → placeholder + zero weight, same as correct_only.
+            prompt_list = [prompt_list[0]]
+            response_list = [response_list[0]]
+            original_idx_list = [original_idx_list[0]]
+            B = 1
+            weight = 0.0
+        else:
+            prompt_list = [prompt_list[i] for i in non_rep_idx]
+            response_list = [response_list[i] for i in non_rep_idx]
+            original_idx_list = [int(original_idx_list[i]) for i in non_rep_idx]
+            B = n_clean
 
     # Validate extracted token ids against the model's vocab. An OOB id
     # here is what crashed previous runs inside the embedding gather
@@ -584,6 +878,8 @@ def maybe_add_consistency_loss(
     idx = torch.randperm(B, generator=g)[:n_use].tolist()
     pl = [prompt_list[i] for i in idx]
     rl = [response_list[i] for i in idx]
+    # Carry the original-id mapping through the fraction subsample.
+    sub_original_idx_list = [int(original_idx_list[i]) for i in idx]
 
     # Teacher selection.
     #   "self" (default): cons target = student's own clean-view logits (CLLM-style).
@@ -670,6 +966,28 @@ def maybe_add_consistency_loss(
                 print(f"[cons-marker] failed to load marker from disk: {_e}", flush=True)
                 marker_embed_override = None
 
+    # On-policy mode: load cascade-evolved drafts straight from micro_batch's
+    # `jacobi_trajectories` non-tensor field (populated by vllm_async_server
+    # from the per-request files written by jacobi_vllm_plugin). When the
+    # field is missing or no samples match, fall through to uniform-random noise.
+    #
+    # `original_indices=sub_original_idx_list` is REQUIRED for correctness: the
+    # cons batch (pl/rl) is the result of correct_only filter + fraction
+    # subsample, so cons-batch index k != original micro_batch index. Without
+    # this mapping, drafts get paired with the wrong response. See
+    # `_load_cascade_drafts_from_micro_batch` for the full bug story.
+    cascade_drafts = None
+    onpolicy_enabled = _read("onpolicy", False, lambda v: str(v).lower() in {"1", "true", "yes"})
+    if onpolicy_enabled:
+        r_lens = [int(r.numel()) for r in rl]
+        cascade_drafts = _load_cascade_drafts_from_micro_batch(
+            micro_batch, r_lens, block_size,
+            original_indices=sub_original_idx_list,
+            debug=_read("debug", False, lambda v: str(v).lower() in {"1", "true", "yes"}),
+        )
+        if cascade_drafts is None and _read("debug", False, lambda v: str(v).lower() in {"1", "true", "yes"}):
+            print("[cons-onpolicy] no jacobi_trajectories in micro_batch; falling back to uniform noise", flush=True)
+
     cons_loss, anchor_loss, cons_metrics = compute_consistency_loss(
         model=engine.module,
         prompt_ids=pl,
@@ -684,6 +1002,7 @@ def maybe_add_consistency_loss(
         compute_anchor=compute_anchor,
         anchor_mode=anchor_mode,
         marker_embed_override=marker_embed_override,
+        cascade_drafts=cascade_drafts,
     )
 
     # === Global per-position normalization ============================
@@ -751,12 +1070,22 @@ def maybe_add_consistency_loss(
     # Apply adaptive scale to BOTH cons and anchor weights. Both are
     # auxiliary losses that should fade alongside PG; scaling them together
     # preserves the cons:anchor ratio chosen at config time.
+    #
+    # NOTE: When `target_ratio > 0` (target_active below) is ALSO set, the
+    # adaptive_ratio multiplication here is later OVERWRITTEN by
+    # `weight = target_lambda * schedule_mult` (search for "target_active"
+    # below). To avoid a misleading non-zero `actor/cons_adaptive_ratio`
+    # metric in that case, we SKIP the multiplication when target_ratio is
+    # going to override it. The ratio is still computed and logged for
+    # observability when adaptive_scale is set alone.
+    target_ratio_will_override = float(_read("target_ratio", 0.0, float)) > 0.0
     adaptive_ratio = 1.0
     if adaptive_scale and _PG_LOSS_INITIAL is not None and _PG_LOSS_INITIAL > 0.0:
         adaptive_ratio = _PG_LOSS_LAST / _PG_LOSS_INITIAL
         adaptive_ratio = max(adaptive_floor, min(adaptive_ceiling, adaptive_ratio))
-        weight = weight * adaptive_ratio
-        anchor_weight = anchor_weight * adaptive_ratio
+        if not target_ratio_will_override:
+            weight = weight * adaptive_ratio
+            anchor_weight = anchor_weight * adaptive_ratio
 
     # Target-ratio mode (Nemotron-Diffusion style), per-STEP edition.
     #
@@ -781,6 +1110,8 @@ def maybe_add_consistency_loss(
     if target_active:
         global _TR_LAST_STEP_ID, _TR_CURRENT_STEP_PG_SUM, _TR_CURRENT_STEP_CONS_SUM
         global _TR_PREV_STEP_PG_ABS, _TR_PREV_STEP_CONS
+        global _TR_CURRENT_STEP_PG_ABS_SUM, _TR_PREV_STEP_PG_ABS_SUM
+        global _TR_CURRENT_STEP_CONS_EFF_SUM, _TR_PREV_STEP_CONS_EFF_SUM
 
         # EMA decay across step snapshots. 0 = single-step lookback (original
         # behavior); 0.9 = blend last step at 10% weight, history at 90% — much
@@ -800,13 +1131,20 @@ def maybe_add_consistency_loss(
                 else:
                     _TR_PREV_STEP_PG_ABS = new_pg_abs
                     _TR_PREV_STEP_CONS = new_cons
+                # Snapshot diagnostics: sum-of-abs PG (no cancellation) + cons_effective totals.
+                _TR_PREV_STEP_PG_ABS_SUM = _TR_CURRENT_STEP_PG_ABS_SUM
+                _TR_PREV_STEP_CONS_EFF_SUM = _TR_CURRENT_STEP_CONS_EFF_SUM
             _TR_CURRENT_STEP_PG_SUM = 0.0
             _TR_CURRENT_STEP_CONS_SUM = 0.0
+            _TR_CURRENT_STEP_PG_ABS_SUM = 0.0
+            _TR_CURRENT_STEP_CONS_EFF_SUM = 0.0
             _TR_LAST_STEP_ID = current_step
 
         # Accumulate this microbatch into the current step's totals.
         _TR_CURRENT_STEP_PG_SUM += float(loss.detach().item())              # SIGNED
         _TR_CURRENT_STEP_CONS_SUM += float(cons_loss_norm.detach().abs().item())  # positive
+        # Diagnostic accumulators (no cancellation across MBs).
+        _TR_CURRENT_STEP_PG_ABS_SUM += float(loss.detach().abs().item())
 
         # Set this microbatch's weight from the previous step's snapshot.
         if (
@@ -865,6 +1203,11 @@ def maybe_add_consistency_loss(
     # for pg, MEAN for cons_loss_effective) approximate the relative gradient
     # contribution to the optimizer step.
 
+    # Accumulate cons_effective per-MB (positive) for the step-level diagnostic.
+    _cons_eff_this_mb = float(weight * float(cons_loss_norm.detach().abs().item()))
+    if target_active:
+        _TR_CURRENT_STEP_CONS_EFF_SUM += _cons_eff_this_mb
+
     if metrics is not None:
         metrics["actor/cons_loss"] = float(cons_loss.detach().item())
         # cons_loss_normalized = the per-chunk value entering backward.
@@ -874,7 +1217,7 @@ def maybe_add_consistency_loss(
         # the gradient.
         metrics["actor/cons_loss_normalized"] = float(cons_loss_norm.detach().item())
         metrics["actor/cons_loss_scale"] = float(cons_loss_scale)
-        metrics["actor/cons_loss_effective"] = float(weight * float(cons_loss_norm.detach().abs().item()))
+        metrics["actor/cons_loss_effective"] = _cons_eff_this_mb
         metrics["actor/cons_weight_effective"] = float(weight)
         metrics["actor/anchor_weight_effective"] = float(anchor_weight)
         metrics["actor/cons_pg_loss_last"] = float(_PG_LOSS_LAST if _PG_LOSS_LAST is not None else 0.0)
@@ -883,6 +1226,20 @@ def maybe_add_consistency_loss(
         if target_active:
             metrics["actor/cons_target_ratio"] = float(target_ratio)
             metrics["actor/cons_target_lambda"] = float(target_lambda if target_lambda is not None else 0.0)
+            # New diagnostics: how target_lambda compares to a "no cancellation"
+            # PG denominator + how the actual per-step cons:pg ratio reads.
+            if _TR_PREV_STEP_PG_ABS_SUM is not None and _TR_PREV_STEP_PG_ABS_SUM > 0:
+                # PG cancellation factor: |Σ signed| / Σ |signed| ∈ [0,1].
+                # 1.0 = all MBs same sign (no cancellation, target_lambda full).
+                # 0.1 = heavy cancellation (target_lambda 10× suppressed).
+                cancel = (_TR_PREV_STEP_PG_ABS or 0.0) / _TR_PREV_STEP_PG_ABS_SUM
+                metrics["actor/pg_cancellation_factor"] = float(cancel)
+            if _TR_PREV_STEP_PG_ABS_SUM is not None and _TR_PREV_STEP_CONS_EFF_SUM is not None and _TR_PREV_STEP_PG_ABS_SUM > 0:
+                # Actual per-MB cons:pg loss-magnitude ratio (last completed step).
+                # If target_ratio is "doing its thing", this should ≈ target_ratio.
+                # When pg cancellation is heavy, this reads << target_ratio.
+                cons_pg_step = _TR_PREV_STEP_CONS_EFF_SUM / _TR_PREV_STEP_PG_ABS_SUM
+                metrics["actor/cons_pg_step_ratio_abs"] = float(cons_pg_step)
         if correct_only:
             metrics["actor/cons_n_correct_used"] = int(n_use)
         if anchor_loss is not None:

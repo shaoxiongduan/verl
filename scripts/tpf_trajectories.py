@@ -28,6 +28,8 @@ def main():
     p.add_argument("--jacobi_max_iterations", type=int, default=128)
     p.add_argument("--temperature", type=float, default=0.6)
     p.add_argument("--batch_size", type=int, default=16)
+    p.add_argument("--jacobi_on_policy", type=int, default=1,
+                   help="1 = on-policy Jacobi (requires T>0); 0 = off-policy (works at T=0)")
     args = p.parse_args()
 
     prompts = []
@@ -52,7 +54,7 @@ def main():
         decode_strategy="jacobi",
         jacobi_block_len=args.jacobi_block_len,
         jacobi_max_iterations=args.jacobi_max_iterations,
-        jacobi_on_policy=True,
+        jacobi_on_policy=bool(args.jacobi_on_policy),
     )
 
     total = 0

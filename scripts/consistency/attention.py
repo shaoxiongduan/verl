@@ -212,6 +212,70 @@ def make_mask_mod(
     return mask_mod
 
 
+def make_mask_mod_variable(
+    pair_idx_per_pos: torch.Tensor,   # (B, Lmax) int, -1 for prompt/pad
+    role_per_pos: torch.Tensor,        # (B, Lmax) int: 0=prompt 1=noisy 2=clean(+bridge)
+    noisy_starts: torch.Tensor,        # (B, T_max) start position of noisy block-0 per pair
+    pad_mask: torch.Tensor,            # (B, Lmax) bool
+    block_len: int = 32,               # N (block size); needed to compute tile_id for K>1 on-policy
+):
+    """Variable-layout mask: uses per-position role/pair_idx lookups instead
+    of modular arithmetic from a uniform stride. Required for on-policy bridge
+    mode where pair j's clean block can be longer than N (=N + gap_{j+1}).
+
+    Multi-tile (K>1) safety: when a pair has K noisy tiles laid out
+    contiguously starting at noisy_starts[b, j], sibling tiles must NOT see
+    each other. We compute tile_id = (pos - noisy_start) // N and gate
+    noisy↔noisy attention on tile_q == tile_k.
+    """
+    PIP = pair_idx_per_pos
+    ROL = role_per_pos
+    NS = noisy_starts
+    PAD = pad_mask
+    N = int(block_len)
+
+    def mask_mod(b, h, q, k):
+        b = b.long()
+        in_range = PAD[b, q] & PAD[b, k]
+        role_q = ROL[b, q]
+        role_k = ROL[b, k]
+        pair_q = PIP[b, q]
+        pair_k = PIP[b, k]
+        is_prompt_q = role_q == 0
+        is_prompt_k = role_k == 0
+        is_noisy_q = role_q == 1
+        is_noisy_k = role_k == 1
+        is_clean_q = role_q == 2
+        is_clean_k = role_k == 2
+        # Prompt-as-query: causal within prompt only.
+        mask_prompt = is_prompt_q & is_prompt_k & (k <= q)
+        # Previous-pair clean blocks (includes bridge regions of those pairs).
+        clean_in_prev_clean = is_clean_k & (pair_k >= 0) & (pair_q >= 0) & (pair_k < pair_q)
+        # Same-pair clean attending to clean (causal within the extended clean).
+        same_pair_clean_attn = is_clean_q & is_clean_k & (pair_q == pair_k) & (k <= q)
+        # Same-pair noisy attending to its OWN tile only (siblings excluded).
+        # Tile id = floor((pos - noisy_start) / N). Pairs are gated above by
+        # pair_q == pair_k so we only need the in-tile constraint here.
+        pair_q_safe = torch.clamp(pair_q, min=0)
+        pair_k_safe = torch.clamp(pair_k, min=0)
+        own_noisy_start_q = NS[b, pair_q_safe]
+        own_noisy_start_k = NS[b, pair_k_safe]
+        tile_q = torch.div(q - own_noisy_start_q, N, rounding_mode="floor")
+        tile_k = torch.div(k - own_noisy_start_k, N, rounding_mode="floor")
+        same_pair_noisy_attn = (
+            is_noisy_q & is_noisy_k
+            & (pair_q == pair_k)
+            & (tile_q == tile_k)
+            & (k >= own_noisy_start_q + tile_q * N)
+            & (k <= q)
+        )
+        mask_noisy = is_noisy_q & (is_prompt_k | clean_in_prev_clean | same_pair_noisy_attn)
+        mask_clean = is_clean_q & (is_prompt_k | clean_in_prev_clean | same_pair_clean_attn)
+        return in_range & (mask_prompt | mask_noisy | mask_clean)
+
+    return mask_mod
+
+
 def build_sdpa_attention_mask(
     prompt_lens: torch.Tensor,
     num_pairs: torch.Tensor,
@@ -222,6 +286,9 @@ def build_sdpa_attention_mask(
     triple_mode: bool = False,
     causal_region_size: int = 0,
     num_noisy_tiles: int = 1,
+    role_per_pos: torch.Tensor | None = None,
+    pair_idx_per_pos: torch.Tensor | None = None,
+    noisy_starts: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Materialize the boolean attention pattern into a (B, 1, Lmax, Lmax)
     additive float mask. 0.0 = allowed, -inf = blocked. SDPA broadcasts
@@ -229,13 +296,37 @@ def build_sdpa_attention_mask(
 
     `causal_region_size`: see make_mask_mod docstring. 0 = pure causal
     (default; bit-identical to original training recipe).
+
+    When `role_per_pos`, `pair_idx_per_pos`, and `noisy_starts` are all
+    provided (on-policy bridge mode), uses the variable-layout mask path
+    (`make_mask_mod_variable`) which looks up per-position role/pair_idx
+    instead of using uniform-stride modular arithmetic. Required because
+    pair j's clean block may be longer than N (N + gap_{j+1} for non-last).
     """
     B, Lmax = pad_mask.shape
-    fn = make_mask_mod(
-        prompt_lens, num_pairs, block_lens, pad_mask,
-        triple_mode=triple_mode, causal_region_size=causal_region_size,
-        num_noisy_tiles=num_noisy_tiles,
+    use_variable = (
+        role_per_pos is not None
+        and pair_idx_per_pos is not None
+        and noisy_starts is not None
+        and not triple_mode
+        and causal_region_size == 0
     )
+    if use_variable:
+        # block_len is uniform across pairs (= N); read from first sample.
+        N_for_mask = int(block_lens[0].item()) if block_lens is not None and block_lens.numel() > 0 else 32
+        fn = make_mask_mod_variable(
+            pair_idx_per_pos=pair_idx_per_pos,
+            role_per_pos=role_per_pos,
+            noisy_starts=noisy_starts,
+            pad_mask=pad_mask,
+            block_len=N_for_mask,
+        )
+    else:
+        fn = make_mask_mod(
+            prompt_lens, num_pairs, block_lens, pad_mask,
+            triple_mode=triple_mode, causal_region_size=causal_region_size,
+            num_noisy_tiles=num_noisy_tiles,
+        )
 
     b_idx = torch.arange(B, device=device).view(B, 1, 1).expand(B, Lmax, Lmax)
     h_idx = torch.zeros((1,), dtype=torch.long, device=device)  # broadcastable

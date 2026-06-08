@@ -124,25 +124,31 @@ def soft_cross_entropy(predicts: torch.Tensor, targets: torch.Tensor, T_soft: fl
 @torch.no_grad()
 def _identify_block_positions(
     batch: InterleavedBatch,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """For each sample b, return (b_idx, k_pos, l_pos, pos_in_block): the
-    (sample, position, position-in-block) tuples of noisy and clean blocks
-    aligned pair-by-pair. Used in 2-block mode.
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """For each sample b, return (b_idx, k_pos, l_pos, pos_in_block, pair_idx):
+    the (sample, position, position-in-block, pair-index) tuples of noisy and
+    clean blocks aligned pair-by-pair. Used in 2-block mode.
 
     `pos_in_block` is the intra-block offset (0..N-1) — needed for dFlash-style
     position-decay weighting w_k = exp(-(k-1)/gamma).
+    `pair_idx` is the pair index j ∈ [0, T_b) — needed for on-policy
+    `onpolicy_prefix_lens` lookup (per-pair prefix-match length).
 
     Output shapes: each is a flat int64 tensor of length sum_b T_b * N_b.
     """
     B = batch.input_ids.shape[0]
     device = batch.input_ids.device
-    b_list, k_list, l_list, pos_list = [], [], [], []
+    b_list, k_list, l_list, pos_list, pair_list = [], [], [], [], []
     P = batch.prompt_lens
     T = batch.num_pairs
     N = batch.block_lens
     pad = batch.pad_mask
     K = int(getattr(batch, "num_noisy_tiles", 1))
     G = K + 1  # tiles per group
+    # On-policy bridge mode: per-pair start tables override the uniform stride.
+    noisy_starts = getattr(batch, "noisy_starts", None)
+    clean_starts = getattr(batch, "clean_starts", None)
+    use_variable = noisy_starts is not None and clean_starts is not None
     for b in range(B):
         Pb = int(P[b].item())
         Tb = int(T[b].item())
@@ -150,11 +156,20 @@ def _identify_block_positions(
         if Tb <= 0 or Nb <= 0:
             continue
         for j in range(Tb):
-            group_start = Pb + G * j * Nb
-            ls = group_start + K * Nb  # clean tile starts after all K noisy tiles
+            if use_variable:
+                # Variable-layout: read per-pair starts. K must be 1 (enforced
+                # by pack.py for on-policy mode).
+                group_start = int(noisy_starts[b, j].item())
+                ls = int(clean_starts[b, j].item())
+            else:
+                group_start = Pb + G * j * Nb
+                ls = group_start + K * Nb
             offs = torch.arange(Nb, dtype=torch.long, device=device)
             for k_tile in range(K):
                 ks = group_start + k_tile * Nb
+                # Use ONLY the first N positions of the clean block — the
+                # bridge extension (positions N..N+gap-1) doesn't have a noisy
+                # counterpart and shouldn't enter the cons loss pairing.
                 keep = pad[b, ks : ks + Nb] & pad[b, ls : ls + Nb]
                 if not keep.any():
                     continue
@@ -163,10 +178,12 @@ def _identify_block_positions(
                 k_list.append(ks + kept_offs)
                 l_list.append(ls + kept_offs)
                 pos_list.append(kept_offs)
+                pair_list.append(torch.full((kept_offs.numel(),), j, dtype=torch.long, device=device))
     if not b_list:
         empty = torch.empty(0, dtype=torch.long, device=device)
-        return empty, empty, empty, empty
-    return torch.cat(b_list), torch.cat(k_list), torch.cat(l_list), torch.cat(pos_list)
+        return empty, empty, empty, empty, empty
+    return (torch.cat(b_list), torch.cat(k_list), torch.cat(l_list),
+            torch.cat(pos_list), torch.cat(pair_list))
 
 
 @torch.no_grad()
@@ -224,6 +241,7 @@ def compute_consistency_loss(
     compute_anchor: bool = False,
     anchor_mode: str = "clean",
     marker_embed_override: torch.Tensor | None = None,
+    cascade_drafts: list[list[tuple[int, int, tuple]]] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, dict]:
     """One consistency forward + soft CE loss.
 
@@ -269,6 +287,7 @@ def compute_consistency_loss(
         generator=gen,
         triple_mode=triple_mode,
         num_noisy_tiles=num_noisy_tiles,
+        cascade_drafts=cascade_drafts,
     ).to(device)
 
     _diag_once = not getattr(compute_consistency_loss, "_diag_dumped", False)
@@ -321,6 +340,12 @@ def compute_consistency_loss(
         triple_mode=triple_mode,
         causal_region_size=_causal_region,
         num_noisy_tiles=num_noisy_tiles,
+        # On-policy bridge mode: variable per-pair clean sizes. Pass the
+        # per-position role / pair_idx tensors so the mask uses lookup
+        # instead of uniform-stride modular arithmetic. None for off-policy.
+        role_per_pos=getattr(batch, "role_per_pos", None),
+        pair_idx_per_pos=getattr(batch, "pair_idx_per_pos", None),
+        noisy_starts=getattr(batch, "noisy_starts", None),
     )
     if _diag_once:
         print(
@@ -463,8 +488,9 @@ def compute_consistency_loss(
         # anchor target reads from UNMARKED-noisy positions.
         k_pos = m_pos
         pos_in_block = None  # triple_mode doesn't supply per-position offset yet
+        pair_idx = None
     else:
-        b_idx, k_pos, l_pos, pos_in_block = _identify_block_positions(batch)
+        b_idx, k_pos, l_pos, pos_in_block, pair_idx = _identify_block_positions(batch)
         u_pos = None
     if _diag_once:
         torch.cuda.synchronize()
@@ -559,6 +585,12 @@ def compute_consistency_loss(
         #   - position-decay weight w_k = exp(-(k-1)/gamma), k=1..N intra-block
         #     (gamma=12 default for block_size=32 — extrapolated from paper)
         # Pairs naturally with CONSISTENCY_NOISE_SOURCE=mask + bidir attention.
+        #
+        # On-policy mode: when `batch.onpolicy_prefix_lens` is provided, each
+        # pair's first `prefix_match_len` positions are CASCADE-CONVERGED
+        # (= committed spec tokens, draft==response by construction). Mask those
+        # out and shift the decay weight to start at position `prefix_match_len`
+        # so the FIRST genuinely-noisy position gets weight 1.
         if pos_in_block is None:
             # 3-block / triple_mode fallback: uniform-weight CE w/o shift.
             gt_tokens = batch.input_ids[b_idx, l_pos]
@@ -571,6 +603,12 @@ def compute_consistency_loss(
             if valid.any():
                 np_clamped = torch.clamp(next_pos, max=batch.pad_mask.shape[-1] - 1)
                 valid = valid & batch.pad_mask[b_idx, np_clamped]
+            # On-policy: filter out positions inside the cascade-converged prefix.
+            prefix_per_pos = None
+            opl = getattr(batch, "onpolicy_prefix_lens", None)
+            if opl is not None and pair_idx is not None:
+                prefix_per_pos = opl[b_idx, pair_idx]  # (n_pos,) long
+                valid = valid & (pos_in_block >= prefix_per_pos)
             if valid.any():
                 b_v = b_idx[valid]
                 k_v = k_pos[valid]
@@ -579,11 +617,34 @@ def compute_consistency_loss(
                 gt_tokens = batch.input_ids[b_v, n_v]
                 student_noisy_v = logits[b_v, k_v, :]
                 gamma = float(_os.environ.get("CONSISTENCY_DFLASH_GAMMA", "12.0"))
+                student_noisy_v_f = student_noisy_v.float()
                 per_pos_losses = F.cross_entropy(
-                    student_noisy_v.float(), gt_tokens, reduction="none",
+                    student_noisy_v_f, gt_tokens, reduction="none",
                 )
-                # k-1 = pos_in_block (k is 1-indexed in the paper)
-                w = torch.exp(-(pos_v.to(per_pos_losses.dtype)) / gamma)
+                # Decay: shift origin so first NOISY position (= position
+                # prefix_match_len) has weight 1. Off-policy: prefix_per_pos
+                # is None or zeros → no shift (legacy behavior).
+                if prefix_per_pos is not None:
+                    pref_v = prefix_per_pos[valid].to(per_pos_losses.dtype)
+                    shifted = (pos_v.to(per_pos_losses.dtype) - pref_v).clamp_min(0.0)
+                else:
+                    shifted = pos_v.to(per_pos_losses.dtype)
+                w = torch.exp(-shifted / gamma)
+
+                # Focal weighting: stack on top of dflash decay.
+                # `(1 - p_correct)^focal_gamma` upweights confidently-wrong
+                # predictions. focal_gamma=0 disables (recovers vanilla dflash_ce).
+                # focal_gamma=2 is the typical focal-loss default.
+                focal_gamma = float(_os.environ.get("CONSISTENCY_FOCAL_GAMMA", "0.0"))
+                if focal_gamma > 0.0:
+                    with torch.no_grad():
+                        # p_correct[i] = softmax(logits[i])[gt[i]]
+                        log_p = F.log_softmax(student_noisy_v_f, dim=-1)
+                        p_correct = log_p.gather(-1, gt_tokens.unsqueeze(-1)).squeeze(-1).exp()
+                        focal_floor = float(_os.environ.get("CONSISTENCY_FOCAL_MIN_WEIGHT", "0.0"))
+                        focal_w = (1.0 - p_correct).clamp_min(0.0).pow(focal_gamma)
+                        focal_w = focal_w.clamp_min(focal_floor)
+                    w = w * focal_w
                 cons_loss = (per_pos_losses * w).sum() / w.sum().clamp_min(1e-12)
             else:
                 cons_loss = logits.sum() * 0.0
@@ -632,6 +693,32 @@ def compute_consistency_loss(
         "cons_n_pairs": int(batch.num_pairs.sum().item()),
         "cons_n_pos": n_pos,
     }
+    # Argmax-on-noisy metric: does student.argmax at the noisy position match
+    # the NEXT clean response token? This is what actually determines Jacobi
+    # acceptance (TPF), independent of which loss variant (CE/KL/forward/reverse)
+    # we're using. Tracked separately from cons_loss because CE log_p
+    # improvement can decouple from argmax flips (LK-losses paper finding).
+    if pos_in_block is not None and n_pos > 0:
+        with torch.no_grad():
+            Nb_m = int(batch.block_lens[0].item())
+            valid_m = (pos_in_block < (Nb_m - 1))
+            if valid_m.any():
+                next_pos_m = l_pos + 1
+                np_clamped_m = torch.clamp(next_pos_m, max=batch.pad_mask.shape[-1] - 1)
+                valid_m = valid_m & batch.pad_mask[b_idx, np_clamped_m]
+            opl_m = getattr(batch, "onpolicy_prefix_lens", None)
+            if opl_m is not None and pair_idx is not None:
+                prefix_m = opl_m[b_idx, pair_idx]
+                valid_m = valid_m & (pos_in_block >= prefix_m)
+            if valid_m.any():
+                b_vm = b_idx[valid_m]
+                k_vm = k_pos[valid_m]
+                n_vm = (l_pos + 1)[valid_m]
+                gt_m = batch.input_ids[b_vm, n_vm]
+                pred_m = logits[b_vm, k_vm, :].argmax(dim=-1)
+                argmax_correct = float((pred_m == gt_m).float().mean().item())
+                metrics["cons_argmax_correct"] = argmax_correct
+                metrics["cons_argmax_n_valid"] = int(valid_m.sum().item())
     if anchor_loss is not None:
         metrics["anchor_loss"] = float(anchor_loss.detach().item())
     if student_teacher_kl_clean is not None:

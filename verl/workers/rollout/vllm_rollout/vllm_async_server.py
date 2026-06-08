@@ -513,12 +513,38 @@ class vLLMHttpServer:
             final_res = output
         assert final_res is not None
 
-        extra_fields = {"global_steps": self.global_steps}
+        extra_fields = {"global_steps": self.global_steps, "vllm_request_id": request_id}
         extract_prompt_logprobs(
             output=final_res,
             num_prompt_logprobs=sampling_params.prompt_logprobs,
             result_dict=extra_fields,
         )
+        # Pick up on-policy Jacobi trajectories for this request, if the
+        # jacobi_vllm_plugin recorded them. The plugin writes per-request JSONL
+        # at `{JACOBI_TRAJ_PATH}.req_{request_id}.jsonl`. We read+delete here
+        # so trajectories travel with the TokenOutput (no separate file IO in
+        # the cons hook), and disk doesn't accumulate.
+        import os as _os, json as _json
+        _traj_path = _os.environ.get("JACOBI_TRAJ_PATH", "")
+        if _traj_path:
+            _per_req_path = f"{_traj_path}.req_{request_id}.jsonl"
+            try:
+                if _os.path.exists(_per_req_path):
+                    with open(_per_req_path) as _f:
+                        _recs = []
+                        for _ln in _f:
+                            _ln = _ln.strip()
+                            if not _ln:
+                                continue
+                            try:
+                                _recs.append(_json.loads(_ln))
+                            except _json.JSONDecodeError:
+                                continue
+                    _os.remove(_per_req_path)
+                    if _recs:
+                        extra_fields["jacobi_trajectories"] = _recs
+            except Exception:
+                pass
         token_ids = final_res.outputs[0].token_ids
         log_probs = None
         if sampling_params.logprobs is not None:
