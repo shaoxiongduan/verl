@@ -1696,3 +1696,33 @@ flips act as "corrections" and the immutable trace diverges after each.
    re-draft from corrections; persistent-canvas repair is the cheap form.
 4. Caveat: `live` counts only verifier forwards; real wall-clock needs a small
    drafter with bounded-lead incremental re-drafting.
+
+## 2026-06-12 — v11 canvas run: step-80 early probe (jsim-16, stop-fixed)
+
+Engine: HF bf16 sims, 16 DS prompts (`deepscaler_tpf_prompts_16.jsonl`), K/W=32,
+W_ar=8, max_new=512, greedy. Ckpt: `ckpts_hf/v11_canvas_step_80` (run
+`jf_math_7b_dapo_ds_4gpu_jacobi_onpolicy_v11_canvas`, init v9_220, β=0.5
+canvas pairs + constant marker, seed-fix 0f640165). Eval node: fs-mbz-gpu-622.
+Raw: `eval_passk/tpf_results/v11/step80/*.jsonl`, log `logs/v11_eval_s80.log`.
+
+| eval | corpus TPF | reference |
+|---|---:|---:|
+| vanilla jsim (`_sim_jacobi_predictor_refresh --refresh none`) | 3.561 (pp-mean 3.621) | v9_220: 3.78 |
+| reppen lb=2 | 3.718 (pp-mean 3.786) | v9_220: 4.10 |
+| assembly causal-canvas control (keepnoise) | 3.393 | v9_220 untrained: 3.64 |
+| assembly bidir + constant marker (keepnoise) | 3.345 | v9_220 untrained bidir: 3.41 |
+| assembly bidir, no marker (keepnoise) | 3.265 | — |
+
+Readings:
+1. **Canvas is learning**: bidir-vs-causal-control gap −0.23 (untrained) →
+   **−0.05** at step 80; the marker is worth +0.08 over no-marker (3.345 vs
+   3.265) — mode flag is functioning at decode.
+2. **Causal mode drifting down** (~−0.2…−0.4 across vanilla/reppen/causal
+   control). Spec §3.6 criterion 1 not currently met. Candidate mechanism:
+   causal cons pairs are β=0.5 of v9's signal (dilution) + RL drift on an
+   already-sharpened policy — not necessarily marker leakage (input-side
+   scoping is unit-tested exact; in-training cons_argmax_correct_causal holds
+   0.40-0.47). Decision point at step-160 eval: if causal keeps eroding,
+   lower CANVAS_FRAC (0.5→0.3) or raise CONSISTENCY_WEIGHT.
+3. In-training canvas argmax: 0.25→0.38 (steps 5→80). MATH val 0.886-0.890
+   (≥0.88 criterion holding).
