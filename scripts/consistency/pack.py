@@ -227,8 +227,18 @@ def build_interleaved_batch(
             drafts_b = cascade_drafts[b] or []
             # Apply max_pairs cap BEFORE clean-size computation so we don't try
             # to look at trajectories beyond what we'll actually pack.
+            # CONSISTENCY_PAIR_SAMPLE=random takes a uniform subset over the
+            # WHOLE response (order preserved — bridge mode needs sorted starts)
+            # instead of the first N windows, which biases cons coverage to the
+            # first ~N*K response tokens and leaves late positions untrained.
             if max_pairs is not None and len(drafts_b) > int(max_pairs):
-                drafts_b = drafts_b[: int(max_pairs)]
+                import os as _os
+                import random as _random
+                if _os.environ.get("CONSISTENCY_PAIR_SAMPLE", "first").lower() == "random":
+                    sel = sorted(_random.sample(range(len(drafts_b)), int(max_pairs)))
+                    drafts_b = [drafts_b[i] for i in sel]
+                else:
+                    drafts_b = drafts_b[: int(max_pairs)]
             for item in drafts_b:
                 s, e, d, _ = _unpack_traj(item)
                 if e - s != N:

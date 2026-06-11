@@ -106,6 +106,10 @@ class JacobiProposer:
         self._req_idx = 0
         self._stash_id = -1
         self._rng = np.random.default_rng(int(os.environ.get("JACOBI_SEED", "0")))
+        # Marker file to confirm this class was instantiated
+        import os as _os
+        with open(f"/tmp/jacobi_proposer_init_{_os.getpid()}.txt", "w") as _f:
+            _f.write(f"JACOBI_DRAFT_INIT={_os.environ.get('JACOBI_DRAFT_INIT', 'argmax_prev')!r}\n")
 
     # No-op stubs for vLLM 0.10.2's proposer interface (called regardless of type).
     def load_model(self, *a, **kw):
@@ -130,6 +134,19 @@ class JacobiProposer:
             _PENDING_DRAFT_PER_REQ.clear()
         i = self._req_idx
         self._req_idx += 1
+
+        # JACOBI_DRAFT_INIT controls how the K-window draft is built.
+        #   "argmax_prev" (default) — vLLM original: prompt tail on cold start, then
+        #                              target_argmax_prev[n_acc+1:] padded with last token
+        #   "random"               — every iter uses K uniformly random vocab tokens
+        #                              (matches our shift-leak / warm_restart sims)
+        init_mode = os.environ.get("JACOBI_DRAFT_INIT", "argmax_prev")
+        if not hasattr(self, "_printed_init"):
+            with open(f"/tmp/jacobi_init_mode_{os.getpid()}.txt", "w") as _f:
+                _f.write(f"JACOBI_DRAFT_INIT={init_mode!r}\n")
+            self._printed_init = True
+        if init_mode == "random":
+            return self._rng.integers(0, self.vocab_size, size=K, dtype=np.int64)
 
         cold_start = (i >= len(_LAST_TARGET_ARGMAX_PER_REQ)
                       or len(_LAST_TARGET_ARGMAX_PER_REQ[i]) != K)
@@ -173,6 +190,12 @@ def _install_proposer_patch():
 
     ngram_module.NgramProposer = JacobiNgramShim
     gmr.NgramProposer = JacobiNgramShim
+    # Verify swap worked
+    import os as _os
+    with open(f"/tmp/jacobi_patch_install_{_os.getpid()}.txt", "w") as _f:
+        _f.write(f"ngram_module.NgramProposer = {ngram_module.NgramProposer}\n")
+        _f.write(f"gmr.NgramProposer = {gmr.NgramProposer}\n")
+        _f.write(f"JacobiNgramShim = {JacobiNgramShim}\n")
 
 
 def _install_rejection_sampler_patch():

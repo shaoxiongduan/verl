@@ -38,6 +38,12 @@ def main():
     p.add_argument("--temperature", type=float, default=0.6)
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--gpu_mem_util", type=float, default=0.6)
+    p.add_argument("--no_stop_fix", action="store_true",
+                   help="Reproduce pre-2026-06-08 behavior: do NOT pass stop_token_ids "
+                        "(native tokenizer eos 151645 only — bare <|endoftext|> runs past).")
+    p.add_argument("--keep_special", action="store_true",
+                   help="skip_special_tokens=False so committed <|endoftext|>/<|im_end|> "
+                        "are visible in the output completion text.")
     args = p.parse_args()
 
     assert args.jacobi_block_len == _K, (
@@ -86,12 +92,18 @@ def main():
     for _sid in (151645, 151643):
         if _sid not in _stop_ids:
             _stop_ids.append(_sid)
-    sp = SamplingParams(
+    _sp_kwargs = dict(
         temperature=args.temperature,
         max_tokens=args.max_new_tokens,
-        stop_token_ids=_stop_ids,
     )
-    print(f"[bench] using stop_token_ids={_stop_ids}", flush=True)
+    if not args.no_stop_fix:
+        _sp_kwargs["stop_token_ids"] = _stop_ids
+    if args.keep_special:
+        _sp_kwargs["skip_special_tokens"] = False
+    sp = SamplingParams(**_sp_kwargs)
+    print(f"[bench] stop_token_ids="
+          f"{'DISABLED (pre-fix repro)' if args.no_stop_fix else _stop_ids}"
+          f"  keep_special={args.keep_special}", flush=True)
 
     # Send ALL prompts in one big batch so per_req_tpf[i] aligns with prompt i.
     # vLLM internally batches/schedules; this just hands the engine all reqs.

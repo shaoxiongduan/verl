@@ -135,6 +135,18 @@ class JacobiProposer:
         i = self._req_idx
         self._req_idx += 1
 
+        # JACOBI_DRAFT_INIT controls the K-window draft policy:
+        #   "argmax_prev" (default) — prompt tail on cold start, then target_argmax_prev[n_acc+1:]
+        #   "random"               — every iter is K uniform random vocab tokens (no acceleration)
+        # JACOBI_REFRESH_AFTER_I: if set, hybrid mode — keep argmax_prev[:I] then refresh
+        #                         argmax_prev[I:K] to uniform random. Simulates a probe with
+        #                         predicted boundary = I. Common values: 5, 8, 10.
+        init_mode = os.environ.get("JACOBI_DRAFT_INIT", "argmax_prev")
+        refresh_after_i_str = os.environ.get("JACOBI_REFRESH_AFTER_I", "")
+        refresh_after_i = int(refresh_after_i_str) if refresh_after_i_str else None
+        if init_mode == "random":
+            return self._rng.integers(0, self.vocab_size, size=K, dtype=np.int64)
+
         cold_start = (i >= len(_LAST_TARGET_ARGMAX_PER_REQ)
                       or len(_LAST_TARGET_ARGMAX_PER_REQ[i]) != K)
         if cold_start:
@@ -145,6 +157,10 @@ class JacobiProposer:
             if tail_len < K:
                 pad = self._rng.integers(0, self.vocab_size, size=K - tail_len, dtype=np.int64)
                 tail = np.concatenate([tail, pad])
+            if refresh_after_i is not None and refresh_after_i < K:
+                # Refresh tail to random
+                pad = self._rng.integers(0, self.vocab_size, size=K - refresh_after_i, dtype=np.int64)
+                tail = np.concatenate([tail[:refresh_after_i], pad])
             return tail
 
         argmax_prev = _LAST_TARGET_ARGMAX_PER_REQ[i]
@@ -157,6 +173,9 @@ class JacobiProposer:
             if tail_len < K:
                 pad = self._rng.integers(0, self.vocab_size, size=K-tail_len, dtype=np.int64)
                 tail = np.concatenate([tail, pad])
+            if refresh_after_i is not None and refresh_after_i < K:
+                pad = self._rng.integers(0, self.vocab_size, size=K - refresh_after_i, dtype=np.int64)
+                tail = np.concatenate([tail[:refresh_after_i], pad])
             return tail
         keep = argmax_prev[start:].astype(np.int64)
         pad_len = K - len(keep)
@@ -164,6 +183,10 @@ class JacobiProposer:
             pad_token = int(keep[-1]) if len(keep) > 0 else int(token_ids_slice[-1])
             pad = np.full(pad_len, pad_token, dtype=np.int64)
             keep = np.concatenate([keep, pad])
+        if refresh_after_i is not None and refresh_after_i < K:
+            # Hybrid: keep keep[:refresh_after_i], refresh rest to random
+            pad = self._rng.integers(0, self.vocab_size, size=K - refresh_after_i, dtype=np.int64)
+            keep = np.concatenate([keep[:refresh_after_i], pad])
         return keep
 
 

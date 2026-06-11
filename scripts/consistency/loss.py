@@ -79,7 +79,7 @@ def _no_gradient_checkpointing(model):
 
 
 def soft_cross_entropy(predicts: torch.Tensor, targets: torch.Tensor, T_soft: float = 1.0,
-                       divergence: str = "forward_kl") -> torch.Tensor:
+                       divergence: str = "forward_kl", reduction: str = "mean") -> torch.Tensor:
     """Soft divergence between student (`predicts`) and teacher (`targets`) logits.
 
     divergence:
@@ -103,22 +103,23 @@ def soft_cross_entropy(predicts: torch.Tensor, targets: torch.Tensor, T_soft: fl
     if divergence == "forward_kl":
         # H(softmax(t), softmax(s)) = -sum( softmax(t) * log_softmax(s) )
         p = log_p.exp()
-        return -(p * log_q).sum(dim=-1).mean()
+        per_pos = -(p * log_q).sum(dim=-1)
     elif divergence == "reverse_kl":
         # sum( softmax(s) * (log_softmax(s) - log_softmax(t).detach()) )
         q = log_q.exp()
-        return (q * (log_q - log_p)).sum(dim=-1).mean()
+        per_pos = (q * (log_q - log_p)).sum(dim=-1)
     elif divergence == "jsd":
         # m = (q + p) / 2  (mixture; in log space: logsumexp([log_q, log_p]) - log 2)
         import math
         log_m = torch.logsumexp(torch.stack([log_q, log_p], dim=0), dim=0) - math.log(2.0)
         q = log_q.exp()
         p = log_p.exp()
-        kl_qm = (q * (log_q - log_m)).sum(dim=-1).mean()
-        kl_pm = (p * (log_p - log_m)).sum(dim=-1).mean()
-        return 0.5 * (kl_qm + kl_pm)
+        per_pos = 0.5 * ((q * (log_q - log_m)).sum(dim=-1) + (p * (log_p - log_m)).sum(dim=-1))
     else:
         raise ValueError(f"Unknown divergence: {divergence!r}")
+    if reduction == "none":
+        return per_pos
+    return per_pos.mean()
 
 
 @torch.no_grad()
@@ -223,6 +224,75 @@ def _identify_block_positions_triple(
         empty = torch.empty(0, dtype=torch.long, device=device)
         return empty, empty, empty, empty
     return torch.cat(b_list), torch.cat(m_list), torch.cat(u_list), torch.cat(l_list)
+
+
+def _mask_tail_dflash_loss(
+    logits: torch.Tensor,
+    batch: "InterleavedBatch",
+    b_idx: torch.Tensor,
+    k_pos: torch.Tensor,
+    l_pos: torch.Tensor,
+    pos_in_block: torch.Tensor,
+    pair_idx: torch.Tensor,
+    mask_id: int,
+    margin: int,
+):
+    """Idea-A mask-tail consistency loss (flat-weighted CE).
+
+    For each pair, let ``pml`` be the cascade-converged prefix length
+    (``onpolicy_prefix_lens``; 0 off-policy) and ``cut = pml + margin``:
+      - block positions ``[pml, cut)``  -> CLEAN target (next rollout token),
+      - block positions ``[cut, N)``    -> MASK-token target (`mask_id`),
+      - block positions ``[0, pml)``     -> skipped (already converged).
+
+    The dFlash position-decay weight is intentionally DROPPED here: a flat
+    weight avoids a strength discontinuity at the clean->mask boundary. The
+    model is taught to draft only ``margin`` tokens past what it has already
+    committed and to emit a canonical "undecided" mask token beyond that,
+    instead of confident-but-wrong tokens.
+
+    Returns (cons_loss, n_clean_positions, n_mask_positions).
+    """
+    Nb = int(batch.block_lens[0].item())
+    next_pos = l_pos + 1
+    opl = getattr(batch, "onpolicy_prefix_lens", None)
+    if opl is not None and pair_idx is not None and pair_idx.numel() > 0:
+        pref = opl[b_idx, pair_idx]
+    else:
+        pref = torch.zeros_like(pos_in_block)
+    cut = pref + int(margin)
+
+    Lmax = batch.pad_mask.shape[-1]
+    # Clean region needs a real (non-pad) NEXT token (shift-by-1 AR target) and
+    # an in-block successor; the mask region needs neither (target is constant).
+    next_real = batch.pad_mask[b_idx, torch.clamp(next_pos, max=Lmax - 1)]
+    clean_sel = (
+        (pos_in_block >= pref)
+        & (pos_in_block < cut)
+        & (pos_in_block < (Nb - 1))
+        & next_real
+    )
+    mask_sel = pos_in_block >= cut
+
+    terms = []
+    n_clean = int(clean_sel.sum().item())
+    n_mask = int(mask_sel.sum().item())
+    if n_clean > 0:
+        bc, kc, nc = b_idx[clean_sel], k_pos[clean_sel], next_pos[clean_sel]
+        terms.append(
+            F.cross_entropy(
+                logits[bc, kc, :].float(), batch.input_ids[bc, nc], reduction="none"
+            )
+        )
+    if n_mask > 0:
+        bm, km = b_idx[mask_sel], k_pos[mask_sel]
+        tgt = torch.full((n_mask,), int(mask_id), dtype=torch.long, device=logits.device)
+        terms.append(
+            F.cross_entropy(logits[bm, km, :].float(), tgt, reduction="none")
+        )
+    if terms:
+        return torch.cat(terms).mean(), n_clean, n_mask
+    return logits.sum() * 0.0, 0, 0
 
 
 def compute_consistency_loss(
@@ -595,6 +665,15 @@ def compute_consistency_loss(
             # 3-block / triple_mode fallback: uniform-weight CE w/o shift.
             gt_tokens = batch.input_ids[b_idx, l_pos]
             cons_loss = F.cross_entropy(student_noisy.float(), gt_tokens, reduction="mean")
+        elif _os.environ.get("CONSISTENCY_MASK_TAIL", "0").lower() in {"1", "true", "yes"}:
+            # Idea A: mask-tail target. Clean CE on [pml, pml+margin), mask-token
+            # CE on [pml+margin, N). Flat-weighted (decay dropped by design).
+            _mask_id = int(_os.environ.get("CONSISTENCY_MASK_TOKEN_ID", "151643"))
+            _margin = int(_os.environ.get("CONSISTENCY_MASK_MARGIN", "8"))
+            cons_loss, _n_clean, _n_mask = _mask_tail_dflash_loss(
+                logits, batch, b_idx, k_pos, l_pos, pos_in_block, pair_idx,
+                _mask_id, _margin,
+            )
         else:
             Nb_loss = int(batch.block_lens[0].item())
             next_pos = l_pos + 1
@@ -649,8 +728,31 @@ def compute_consistency_loss(
             else:
                 cons_loss = logits.sum() * 0.0
     else:
-        cons_loss = soft_cross_entropy(student_noisy, teacher_clean, T_soft=T_soft,
-                                       divergence=divergence) * (T_soft * T_soft)
+        kl_decay = _os.environ.get("CONSISTENCY_KL_DECAY", "0").lower() in {"1", "true", "yes"}
+        if kl_decay and pos_in_block is not None:
+            # dFlash-style position decay on the soft (KL) loss, mirroring the
+            # dflash_ce path: (a) mask out cascade-converged prefix positions
+            # (pos < pml — their KL is trivially small and dilutes the loss),
+            # (b) weight w = exp(-(pos - pml)/gamma) so the first genuinely
+            # noisy position carries weight 1 — matching the prefix-gated
+            # structure of Jacobi acceptance (position j only matters if
+            # 0..j-1 all accepted).
+            per_pos = soft_cross_entropy(
+                student_noisy, teacher_clean, T_soft=T_soft,
+                divergence=divergence, reduction="none",
+            ) * (T_soft * T_soft)
+            gamma = float(_os.environ.get("CONSISTENCY_DFLASH_GAMMA", "12.0"))
+            opl = getattr(batch, "onpolicy_prefix_lens", None)
+            if opl is not None and pair_idx is not None:
+                pref = opl[b_idx, pair_idx].to(per_pos.dtype)
+            else:
+                pref = torch.zeros_like(per_pos)
+            shifted = pos_in_block.to(per_pos.dtype) - pref
+            w = torch.exp(-shifted.clamp_min(0.0) / gamma) * (shifted >= 0).to(per_pos.dtype)
+            cons_loss = (per_pos * w).sum() / w.sum().clamp_min(1e-12)
+        else:
+            cons_loss = soft_cross_entropy(student_noisy, teacher_clean, T_soft=T_soft,
+                                           divergence=divergence) * (T_soft * T_soft)
 
     anchor_loss = None
     if compute_anchor:

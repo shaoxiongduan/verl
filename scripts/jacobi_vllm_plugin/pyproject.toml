@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jacobi-vllm-plugin"
+version = "0.1.0"
+description = "vLLM general plugin that enables Jacobi spec decoding via ngram-slot hijack"
+requires-python = ">=3.9"
+dependencies = ["numpy"]
+
+[project.entry-points."vllm.general_plugins"]
+jacobi = "jacobi_vllm_plugin:install"
+
+[tool.setuptools.packages.find]
+where = ["."]

@@ -1,29 +1,24 @@
-"""Warm-restart with imprecise boundary predictor.
+"""Warm-restart with imprecise boundary predictor — ERROR-OFFSET parameterization.
 
 Setup: a lightweight predictor identifies WHERE the clean prefix ends within
-the K-block. The predictor outputs an "M" — number of leading warm positions
-to trust. Beyond M, we don't trust the warm draft (predictor says "noise").
+the K-block. The predictor outputs a boundary, but might be OFF by `offset_M`
+tokens. We simulate the predictor being M tokens off (corrupts the first M
+positions of the warm draft with random noise — those are positions the
+predictor mislabeled).
+
+  offset_M=0 = perfect predictor → equivalent to warm_restart (max TPF ~6)
+  offset_M=N = predictor off by N positions, first N warm preds replaced w/ noise
 
 Each cycle:
   1. Warm forward: input `[committed | K random]` → warm_argmax (K model preds)
-  2. Build verify draft:
-       - First M positions = warm_argmax[0:M]   (the trusted-by-predictor part)
-       - Last (K-M) positions = fresh uniform random noise
-     This simulates: "predictor says first M tokens are clean candidates;
-     beyond M is noise that needs another verify pass later"
-  3. Verify forward: input `[committed | mixed_draft]` → verify_argmax
-  4. Accept: standard greedy spec-decode prefix match between mixed_draft and
-     verify_argmax. n_acc ≤ M because positions ≥ M are random noise that
-     won't match.
-  5. Commit n_acc + 1 tokens. Next cycle starts fresh.
-
-If predictor is PERFECT (M = K = 32): equivalent to warm_restart → ~5.01 n_acc
-If predictor is OFF (small M): n_acc capped at M, TPF ≤ M + 1
-If predictor is "exactly right" (M ≈ 5 for math_k3): n_acc ≈ 5, TPF ≈ 6
-If predictor over-shoots (M > 5): TPF still ~5 (model's denoising capacity is fixed)
-If predictor under-shoots (M < 5): TPF drops to M+1 (we artificially throw away accept positions)
-
-This tells us how MUCH PRECISION the boundary predictor needs.
+  2. Corrupt first offset_M positions with random (predictor's mislabeled tail):
+       corrupted = [M_random] + warm_argmax[M:]  (length K)
+  3. Verify forward: input `[committed | corrupted]` → verify_argmax
+  4. Accept: standard greedy spec-decode prefix match. Random tokens at
+     positions 0..M-1 won't match → n_acc < M usually.
+     BUT: if model is robust, verify[j] for j>M may still match warm_argmax[j]
+     even though the corrupted prefix poisoned the context.
+  5. Commit n_acc + 1 tokens.
 """
 from __future__ import annotations
 import argparse, json, random, torch
@@ -36,8 +31,8 @@ def parse_args():
     p.add_argument("--prompts_jsonl", required=True)
     p.add_argument("--out_jsonl", required=True)
     p.add_argument("--K", type=int, default=32)
-    p.add_argument("--trust_M", type=int, required=True,
-                   help="Number of leading warm positions the predictor trusts")
+    p.add_argument("--offset_M", type=int, required=True,
+                   help="Predictor error: corrupt first M positions of warm draft with random noise")
     p.add_argument("--max_new", type=int, default=512)
     p.add_argument("--max_cycles", type=int, default=128)
     p.add_argument("--vocab_size", type=int, default=152064)
@@ -49,7 +44,7 @@ def parse_args():
 def simulate(model, tok, prompt_ids, args, rng):
     device = model.device
     K = args.K
-    M = args.trust_M
+    M = args.offset_M
     eos_id = tok.eos_token_id
     alt_eos = 151645
     committed = list(prompt_ids)
@@ -64,9 +59,11 @@ def simulate(model, tok, prompt_ids, args, rng):
         inp1 = torch.tensor([committed + random_draft], dtype=torch.long, device=device)
         warm = model(input_ids=inp1).logits[0, L - 1 : L - 1 + K, :].argmax(dim=-1).cpu().tolist()
 
-        # Build verify draft: keep first M of warm, replace rest with fresh random
-        noise_tail = [rng.randrange(args.vocab_size) for _ in range(K - M)]
-        mixed_draft = warm[:M] + noise_tail  # length K
+        # CORRUPT first M positions of warm with random noise (predictor's error).
+        # Beyond M, the predictor was right, so we keep warm_argmax.
+        # offset_M=0 → no corruption, identical to warm_restart.
+        corrupt_prefix = [rng.randrange(args.vocab_size) for _ in range(M)]
+        mixed_draft = corrupt_prefix + warm[M:K]  # length K
 
         # Verify forward
         inp2 = torch.tensor([committed + mixed_draft], dtype=torch.long, device=device)
@@ -99,7 +96,7 @@ def simulate(model, tok, prompt_ids, args, rng):
         "tpf_all_forwards": total_tok / max(1, 2 * n_cycles),
         "mean_n_acc": sum(n_acc_history) / max(1, len(n_acc_history)),
         "n_acc_history": n_acc_history,
-        "trust_M": M,
+        "offset_M": M,
     }
 
 
@@ -110,7 +107,7 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16, device_map="cuda:0")
     model.eval()
     prompts = [json.loads(l) for l in open(args.prompts_jsonl)]
-    print(f"[sim] warm_trust_boundary trust_M={args.trust_M} K={args.K} max_new={args.max_new} n={len(prompts)}", flush=True)
+    print(f"[sim] warm_trust_boundary trust_M={args.offset_M} K={args.K} max_new={args.max_new} n={len(prompts)}", flush=True)
     rng = random.Random(args.seed)
     out_fp = open(args.out_jsonl, "w")
     rows = []
@@ -123,11 +120,11 @@ def main():
         rows.append(r)
         out_fp.write(json.dumps(r) + "\n")
         out_fp.flush()
-        print(f"[sim] [{i+1}/{len(prompts)}] trust_M={args.trust_M} ntok={r['n_tokens']:4d} cycles={r['n_cycles']:4d} TPF_verify={r['tpf_verify']:.3f} TPF_all={r['tpf_all_forwards']:.3f} mean_n_acc={r['mean_n_acc']:.2f}", flush=True)
+        print(f"[sim] [{i+1}/{len(prompts)}] trust_M={args.offset_M} ntok={r['n_tokens']:4d} cycles={r['n_cycles']:4d} TPF_verify={r['tpf_verify']:.3f} TPF_all={r['tpf_all_forwards']:.3f} mean_n_acc={r['mean_n_acc']:.2f}", flush=True)
     mean_v = sum(r["tpf_verify"] for r in rows) / len(rows)
     mean_a = sum(r["tpf_all_forwards"] for r in rows) / len(rows)
     mean_nacc = sum(r["mean_n_acc"] for r in rows) / len(rows)
-    print(f"\n[sim] trust_M={args.trust_M}: mean TPF_verify={mean_v:.3f}, TPF_all={mean_a:.3f}, mean_n_acc/cycle={mean_nacc:.3f}", flush=True)
+    print(f"\n[sim] trust_M={args.offset_M}: mean TPF_verify={mean_v:.3f}, TPF_all={mean_a:.3f}, mean_n_acc/cycle={mean_nacc:.3f}", flush=True)
 
 
 if __name__ == "__main__":
