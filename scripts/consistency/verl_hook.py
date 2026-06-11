@@ -1013,8 +1013,15 @@ def maybe_add_consistency_loss(
         if float(_cv_frac) > 0.0:
             print(
                 f"[cons-canvas] v11 canvas mode ACTIVE: frac={_cv_frac} "
+                f"construction={os.environ.get('CONSISTENCY_CANVAS_CONSTRUCTION', 'levels')} "
                 f"levels={os.environ.get('CONSISTENCY_CANVAS_LEVELS', '1.0,0.75,0.5,0.25,0.125')} "
+                f"levels_frac={os.environ.get('CONSISTENCY_CANVAS_LEVELS_FRAC', '0.25')} "
+                f"p_near={os.environ.get('CONSISTENCY_CANVAS_P_NEAR', '0.6')} "
+                f"p_far={os.environ.get('CONSISTENCY_CANVAS_P_FAR', '0.1')} "
+                f"max_commit={os.environ.get('CONSISTENCY_CANVAS_MAX_COMMIT', '8')} "
                 f"plausible_frac={os.environ.get('CONSISTENCY_CANVAS_PLAUSIBLE_FRAC', '0.0')} "
+                f"canvas_loss={os.environ.get('CONSISTENCY_CANVAS_LOSS', '(inherit)')} "
+                f"canvas_mult={os.environ.get('CONSISTENCY_CANVAS_WEIGHT_MULT', '1.0')} "
                 f"marker={'ON type=' + marker_type if use_marker else 'OFF'}",
                 flush=True,
             )
