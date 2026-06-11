@@ -75,6 +75,7 @@ _MARKER_EMBED = None   # marker row loaded from disk (per worker process)
 _PG_LOSS_LAST = None        # float | None — last observed |loss| this rank
 _PG_LOSS_INITIAL = None     # float | None — locked reference after warmup
 _ADAPTIVE_WARMUP_COUNT = 0  # number of microbatches seen so far (warmup gate)
+_CONS_CALL_COUNT = 0        # per-rank cons-call counter (pack seed diversity)
 
 # Per-step accumulator for target_ratio. Within a step we accumulate the
 # signed sum of per-microbatch pg loss (matches verl's actor/pg_loss SUM
@@ -873,9 +874,20 @@ def maybe_add_consistency_loss(
     n_use = max(1, int(round(B * fraction)))
     # Random subset for cost control. Use the trainer's global step as seed
     # so all DP ranks pick the same indices (simple sync).
-    seed = int(getattr(engine, "_global_step", 0)) if hasattr(engine, "_global_step") else 0
+    #
+    # NOTE (2026-06-11): this previously read `engine._global_step`, which
+    # does not exist — seed was 0 on EVERY step and microbatch, freezing the
+    # pack generator's corruption pattern for the whole run (observed as
+    # cons_canvas_pos_frac stuck at 0.69 instead of ~CANVAS_FRAC). Use the
+    # already-extracted `current_step` (same on all DP ranks) for the synced
+    # subsample, and a per-call-distinct seed for the pack generator so the
+    # canvas coins / renoise sets vary across microbatches and steps.
+    seed = int(current_step)
     g = torch.Generator().manual_seed(seed)
     idx = torch.randperm(B, generator=g)[:n_use].tolist()
+    global _CONS_CALL_COUNT
+    _CONS_CALL_COUNT += 1
+    pack_seed = int(current_step) * 1000003 + _CONS_CALL_COUNT
     pl = [prompt_list[i] for i in idx]
     rl = [response_list[i] for i in idx]
     # Carry the original-id mapping through the fraction subsample.
@@ -1015,7 +1027,7 @@ def maybe_add_consistency_loss(
         pad_id=pad_id,
         max_pairs=max_pairs,
         T_soft=T_soft,
-        seed=seed,
+        seed=pack_seed,
         divergence=divergence,
         teacher_model=teacher_model,
         compute_anchor=compute_anchor,
