@@ -24,8 +24,8 @@ cd /mnt/weka/home/hao.zhang/shao/verl
 export PROJECT_NAME=jacobi_forcing_dapo_deepscaler_onpolicy
 export EXP_NAME=${EXP_NAME:-jf_math_7b_dapo_ds_4gpu_jacobi_onpolicy_v11_canvas}
 
-# --- init from best causal ckpt (v9 s220) ---
-export JF_MODEL=/mnt/weka/home/hao.zhang/shao/verl/ckpts_hf/fwdkl_decay_v9_step_220
+# --- init from best causal ckpt (v9 s220); overridable (run_v11_canvas_base.sh) ---
+export JF_MODEL=${JF_MODEL:-/mnt/weka/home/hao.zhang/shao/verl/ckpts_hf/fwdkl_decay_v9_step_220}
 
 # --- cons loss (causal-pair half): forward KL to frozen base, decay-weighted ---
 export CONSISTENCY_LOSS_TYPE=kl
