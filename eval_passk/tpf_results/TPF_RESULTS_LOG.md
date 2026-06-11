@@ -1769,3 +1769,35 @@ step-80 battery (`v11/step80/`). NEVER compare across update rules.
    38-44% of the time. Training/decode state mismatch is the headline lever
    → v11.1 proposal (empirical-state construction, CE-to-rollout target,
    canvas weight mult, keep_tau sweep) pending sign-off.
+
+## 2026-06-12 — Decode-side sweeps on v11_s100 (assembly, 16 DS prompts)
+
+Raw: `eval_passk/tpf_results/v11/decode_sweeps/`. All bidir+constant-marker
+unless noted; W=32/W_ar=8 default.
+
+| arm | TPF |
+|---|---:|
+| keepnoise tau=1.0 | 3.080 |
+| keepnoise tau=2.0 | 3.234 |
+| keepnoise tau=4.0 | 3.340 |
+| keepnoise tau=8.0 | 3.340 |
+| argmax update | 3.340 |
+| causal control (argmax, no marker) | 3.417 |
+| W=24 argmax (canvas 16) | 3.336 |
+| W=56 argmax (canvas 48) | 3.301 |
+| W=24 keepnoise tau=2 | 3.229 |
+| W=56 keepnoise tau=2 | 3.222 |
+| gumbel T=0.7 keepnoise tau=2 | 2.934 |
+
+1. tau>=4 keepnoise == argmax update token-identically (nothing re-noised):
+   keep-everything is the best canvas update at current canvas quality.
+   Re-noising (the DiffusionGemma-style rule training was co-designed with)
+   is strictly harmful right now.
+2. s100 gap (argmax): -0.077 (untrained -0.185, s80 -0.101) — still closing.
+   But absolute TPF of BOTH arms keeps eroding (causal 3.71→3.55→3.42),
+   pace accelerating — v9-style late-phase decline; early-ckpt selection
+   likely (80-140 window).
+3. Residence curve FLAT (3.34/3.34/3.30 for canvas 16/24/48): refinement
+   does not accumulate — more residence buys nothing until canvas quality
+   rises (the v11.1 training-side lever, not a decode knob).
+4. Gumbel candidates hurt (2.93). Dropped.
