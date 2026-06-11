@@ -1801,3 +1801,21 @@ unless noted; W=32/W_ar=8 default.
    does not accumulate — more residence buys nothing until canvas quality
    rises (the v11.1 training-side lever, not a decode knob).
 4. Gumbel candidates hurt (2.93). Dropped.
+
+## 2026-06-12 — v11.0 step-160 milestone (argmax-update protocol, jsim-16)
+
+Ckpt `ckpts_hf/v11_canvas_step_160`; raw `eval_passk/tpf_results/v11/step160/`.
+
+| eval | s160 | (untrained / s80 / s100) |
+|---|---:|---|
+| vanilla jsim | 3.438 (pp 3.507) | 3.78 / 3.56 / — |
+| reppen lb=2 | 3.779 (pp 3.849) | 4.10 / 3.72 / — |
+| asm causal/argmax | 3.422 | 3.706 / 3.551 / 3.417 |
+| asm bidir+marker/argmax | 3.371 | 3.521 / 3.450 / 3.340 |
+| asm bidir/argmax | 3.317 | 3.524 / 3.397 / — |
+
+Gap −0.051 (monotone from −0.185; crossover projected ~s200). Marker +0.054.
+Causal healthy under matched-total-steps criterion (380 total: 3.44 vs v9
+extrapolation ~2.8-3.0; reppen ROSE s80→s160; causal-control erosion flat
+s100→s160). Step-140 in-training argmax spike (0.419) = variance, not regime
+change.
