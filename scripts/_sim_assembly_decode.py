@@ -47,6 +47,10 @@ def parse_args():
     p.add_argument("--temp", type=float, default=1.0)
     p.add_argument("--max_new", type=int, default=512)
     p.add_argument("--max_fwd", type=int, default=512)
+    # Per-forward trace dump: window state BEFORE update, candidates, keep
+    # mask, acceptance — plus the final committed tokens per prompt. Feeds
+    # _analyze_assembly_trace.py (decode-time noise-profile vs training).
+    p.add_argument("--trace_jsonl", default=None)
     p.add_argument("--n_prompts", type=int, default=16)
     p.add_argument("--vocab_size", type=int, default=152064)
     p.add_argument("--seed", type=int, default=42)
@@ -66,7 +70,7 @@ def build_mask(L0, W, W_ar, bidir, device, dtype):
 
 
 @torch.no_grad()
-def decode(model, prompt_ids, args, rng, marker_vec=None):
+def decode(model, prompt_ids, args, rng, marker_vec=None, trace=None, prompt_idx=0):
     W, W_ar = args.W, args.W_ar
     committed = list(prompt_ids)
     window = [rng.randrange(args.vocab_size) for _ in range(W)]
@@ -111,14 +115,26 @@ def decode(model, prompt_ids, args, rng, marker_vec=None):
             break
         # zone updates: AR zone Jacobi (causal argmax), canvas per policy
         upd = list(cur)
+        keep_mask = None
         if args.canvas_update == "keepnoise":
             lp = F.log_softmax(logits[W_ar:].float(), dim=-1)
             ent = (-(lp.exp() * lp).sum(-1)).cpu().tolist()
+            keep_mask = [ent[j] <= args.keep_tau for j in range(W - W_ar)]
             for j in range(W - W_ar):
-                if ent[j] > args.keep_tau:
+                if not keep_mask[j]:
                     upd[W_ar + j] = rng.randrange(args.vocab_size)
+        if trace is not None:
+            trace.write(json.dumps({
+                "p": prompt_idx, "fwd": n_fwd, "L0": L0, "win": window,
+                "cand": cur, "keep": keep_mask, "n_acc": n_acc,
+                "n_commit": len(toks),
+            }) + "\n")
         n = len(toks)
         window = upd[n:] + [rng.randrange(args.vocab_size) for _ in range(n)]
+    if trace is not None:
+        trace.write(json.dumps({
+            "p": prompt_idx, "final": committed, "prompt_len": len(prompt_ids),
+        }) + "\n")
     return total, n_fwd
 
 
@@ -139,17 +155,21 @@ def main():
         print(f"[asm] marker=constant scale={args.marker_scale} "
               f"norm={float(marker_vec.float().norm().item()):.3f}", flush=True)
     T = F_ = 0
+    trace = open(args.trace_jsonl, "w") if args.trace_jsonl else None
     with open(args.out_jsonl, "w") as f:
         for i, p in enumerate(prompts):
             chat = [{"role": "user", "content": p["input"]}]
             text = tok.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
             pid = tok(text, return_tensors="pt").input_ids[0].tolist()
-            tot, nf = decode(model, pid, args, rng, marker_vec=marker_vec)
+            tot, nf = decode(model, pid, args, rng, marker_vec=marker_vec,
+                             trace=trace, prompt_idx=i)
             T += tot; F_ += nf
             f.write(json.dumps({"batch_idx": i, "n_tokens": tot, "n_forwards": nf,
                                 "tpf": tot / max(1, nf)}) + "\n")
             print(f"[asm] [{i+1}/{len(prompts)}] {args.canvas_attn}/{args.canvas_update} "
                   f"marker={args.marker} tok={tot} fwd={nf} TPF={tot/max(1,nf):.2f}", flush=True)
+    if trace is not None:
+        trace.close()
     print(f"[asm] canvas={args.canvas_attn} update={args.canvas_update} W_ar={args.W_ar} "
           f"marker={args.marker} cand={args.candidates}: "
           f"CORPUS TPF = {T}/{F_} = {T/max(1,F_):.4f}")

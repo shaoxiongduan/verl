@@ -1738,3 +1738,34 @@ steps. No env change; re-eval at 160 (healthy = vanilla ≳3.3-3.5). If
 intervention ever needed: 2× CONSISTENCY_WEIGHT, keep CANVAS_FRAC=0.5.
 Checkpoint selection may simply favor early ckpts (80-160) — selection, not
 failure.
+
+## 2026-06-12 — Assembly comparability matrix: update-rule confound resolved
+
+{v9_220, v11_s80} × {causal, bidir, bidir+marker} × {argmax, keepnoise},
+16 DS prompts, W=32/W_ar=8, max_new=512, HF bf16, node 422 GPUs 4-7.
+Raw: `eval_passk/tpf_results/v11/matrix/`, keepnoise s80 arms from the
+step-80 battery (`v11/step80/`). NEVER compare across update rules.
+
+| arm | v9_220 | v11_s80 |
+|---|---:|---:|
+| causal/argmax | 3.706 | 3.551 |
+| bidir/argmax | 3.524 | 3.397 |
+| bidir+marker/argmax | 3.521 | 3.450 |
+| causal/keepnoise | 3.589 | 3.393 |
+| bidir/keepnoise | 3.453 | 3.265 |
+| bidir+marker/keepnoise | 3.424 | 3.345 |
+
+1. True causal erosion at s80 = −0.16 (argmax) / −0.20 (keepnoise), NOT the
+   −0.25 previously logged from a keepnoise-vs-spec-argmax mixed comparison.
+2. Canvas gap (bidir+marker − causal control): −0.185 → −0.101 (argmax),
+   −0.165 → −0.048 (keepnoise). 45-71% closed in 80 steps; no crossover yet.
+3. Marker: neutral untrained (−0.00/−0.03), +0.05/+0.08 at s80 — the mode
+   flag is learned, not free.
+4. argmax update > keepnoise everywhere (+0.07-0.16) at keep_tau=2.0 —
+   matches trace audit (kept tokens 56% correct vs candidates 37% vs fresh
+   noise ~0): re-noising destroys carried state.
+5. Decode-trace audit (same day, `v11/traces/`): real canvas inputs are 0-9%
+   clean vs training's assumed 35-54%; kept tokens are model picks wrong
+   38-44% of the time. Training/decode state mismatch is the headline lever
+   → v11.1 proposal (empirical-state construction, CE-to-rollout target,
+   canvas weight mult, keep_tau sweep) pending sign-off.
