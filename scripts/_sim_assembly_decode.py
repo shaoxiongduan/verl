@@ -15,10 +15,13 @@ positions). Window slides by the commit length; canvas tokens graduate into
 the AR zone; fresh random tokens enter at the far end.
 """
 from __future__ import annotations
-import argparse, json, random
+import argparse, json, os, random, sys
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from consistency.loss import _constant_marker  # same vector as training-time marker
 
 STOP_IDS = {151645, 151643}
 
@@ -33,6 +36,15 @@ def parse_args():
     p.add_argument("--canvas_attn", choices=["bidir", "causal"], default="bidir")
     p.add_argument("--canvas_update", choices=["argmax", "keepnoise"], default="argmax")
     p.add_argument("--keep_tau", type=float, default=2.0)
+    # v11: additive mode marker on canvas-position input embeddings. "constant"
+    # = the training-time CONSISTENCY_MARKER_TYPE=constant vector (sinusoidal
+    # row 0, imported from consistency.loss for bit-equality with training).
+    p.add_argument("--marker", choices=["none", "constant"], default="none")
+    p.add_argument("--marker_scale", type=float, default=1.0)
+    # Canvas candidate sampling: argmax (v1) or Gumbel logits/T + g (the AR
+    # zone always uses argmax — its verify/commit must stay exact-greedy).
+    p.add_argument("--candidates", choices=["argmax", "gumbel"], default="argmax")
+    p.add_argument("--temp", type=float, default=1.0)
     p.add_argument("--max_new", type=int, default=512)
     p.add_argument("--max_fwd", type=int, default=512)
     p.add_argument("--n_prompts", type=int, default=16)
@@ -54,18 +66,32 @@ def build_mask(L0, W, W_ar, bidir, device, dtype):
 
 
 @torch.no_grad()
-def decode(model, prompt_ids, args, rng):
+def decode(model, prompt_ids, args, rng, marker_vec=None):
     W, W_ar = args.W, args.W_ar
     committed = list(prompt_ids)
     window = [rng.randrange(args.vocab_size) for _ in range(W)]
     total = n_fwd = 0
+    emb_layer = model.get_input_embeddings() if marker_vec is not None else None
     while total < args.max_new and n_fwd < args.max_fwd:
         L0 = len(committed)
         inp = torch.tensor([committed + window], dtype=torch.long, device=model.device)
         mask = build_mask(L0, W, W_ar, args.canvas_attn == "bidir",
                           model.device, model.dtype)
-        logits = model(input_ids=inp, attention_mask=mask).logits[0, L0 - 1: L0 - 1 + W, :]
+        if marker_vec is not None:
+            # Add the mode marker to canvas-position embeddings only (the AR
+            # zone and committed prefix stay unmarked = AR mode).
+            embeds = emb_layer(inp)
+            embeds[0, L0 + W_ar:, :] += args.marker_scale * marker_vec
+            logits = model(inputs_embeds=embeds, attention_mask=mask).logits[0, L0 - 1: L0 - 1 + W, :]
+        else:
+            logits = model(input_ids=inp, attention_mask=mask).logits[0, L0 - 1: L0 - 1 + W, :]
         cur = logits.argmax(dim=-1).cpu().tolist()
+        if args.candidates == "gumbel":
+            # Gumbel candidates for the CANVAS only; AR-zone verification at
+            # positions [0, W_ar) must remain exact-greedy argmax.
+            lg = logits[W_ar:].float() / max(args.temp, 1e-6)
+            gn = -torch.log(-torch.log(torch.rand_like(lg).clamp_min(1e-20)).clamp_min(1e-20))
+            cur[W_ar:] = (lg + gn).argmax(dim=-1).cpu().tolist()
         n_fwd += 1
         # AR-zone verification (positions 0..W_ar-1 only; logits there are exact AR)
         n_acc = 0
@@ -105,19 +131,27 @@ def main():
         attn_implementation="sdpa").eval()
     prompts = [json.loads(l) for l in open(args.prompts_jsonl)][: args.n_prompts]
     rng = random.Random(args.seed)
+    torch.manual_seed(args.seed)  # gumbel noise reproducibility
+    marker_vec = None
+    if args.marker == "constant":
+        H = model.config.hidden_size
+        marker_vec = _constant_marker(H, model.device, model.dtype)
+        print(f"[asm] marker=constant scale={args.marker_scale} "
+              f"norm={float(marker_vec.float().norm().item()):.3f}", flush=True)
     T = F_ = 0
     with open(args.out_jsonl, "w") as f:
         for i, p in enumerate(prompts):
             chat = [{"role": "user", "content": p["input"]}]
             text = tok.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
             pid = tok(text, return_tensors="pt").input_ids[0].tolist()
-            tot, nf = decode(model, pid, args, rng)
+            tot, nf = decode(model, pid, args, rng, marker_vec=marker_vec)
             T += tot; F_ += nf
             f.write(json.dumps({"batch_idx": i, "n_tokens": tot, "n_forwards": nf,
                                 "tpf": tot / max(1, nf)}) + "\n")
             print(f"[asm] [{i+1}/{len(prompts)}] {args.canvas_attn}/{args.canvas_update} "
-                  f"tok={tot} fwd={nf} TPF={tot/max(1,nf):.2f}", flush=True)
-    print(f"[asm] canvas={args.canvas_attn} update={args.canvas_update} W_ar={args.W_ar}: "
+                  f"marker={args.marker} tok={tot} fwd={nf} TPF={tot/max(1,nf):.2f}", flush=True)
+    print(f"[asm] canvas={args.canvas_attn} update={args.canvas_update} W_ar={args.W_ar} "
+          f"marker={args.marker} cand={args.candidates}: "
           f"CORPUS TPF = {T}/{F_} = {T/max(1,F_):.4f}")
 
 

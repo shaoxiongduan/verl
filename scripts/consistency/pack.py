@@ -101,6 +101,15 @@ class InterleavedBatch:
     #   pair_idx_per_pos[b, l]: pair index (0..T-1) for noisy/clean, -1 else
     role_per_pos: torch.Tensor | None = None       # (B, Lmax) int8
     pair_idx_per_pos: torch.Tensor | None = None    # (B, Lmax) int64
+    # v11 canvas mode (CONSISTENCY_CANVAS_FRAC > 0): per-pair mode flag.
+    # Canvas pairs are dLLM-style training pairs: noisy tile = clean window
+    # with round(f*N) positions renoised to fresh uniform-random tokens
+    # (f ~ Uniform{CONSISTENCY_CANVAS_LEVELS}, far-weighted position choice
+    # w_j ∝ 0.5 + j/N), fully-bidirectional intra-tile attention, marker ON,
+    # uniform-weight loss. Causal (non-canvas) pairs keep v9 behavior exactly.
+    # Both stay None when canvas mode is off (bit-identical legacy path).
+    canvas_pairs: torch.Tensor | None = None       # (B, T_max) bool
+    canvas_mask: torch.Tensor | None = None        # (B, Lmax) bool — noisy positions of canvas pairs
 
     def to(self, device):
         return InterleavedBatch(
@@ -121,6 +130,8 @@ class InterleavedBatch:
             clean_starts=self.clean_starts.to(device) if self.clean_starts is not None else None,
             role_per_pos=self.role_per_pos.to(device) if self.role_per_pos is not None else None,
             pair_idx_per_pos=self.pair_idx_per_pos.to(device) if self.pair_idx_per_pos is not None else None,
+            canvas_pairs=self.canvas_pairs.to(device) if self.canvas_pairs is not None else None,
+            canvas_mask=self.canvas_mask.to(device) if self.canvas_mask is not None else None,
         )
 
 
@@ -340,6 +351,68 @@ def build_interleaved_batch(
             f"got CONSISTENCY_NOISE_SOURCE='mask' which is deterministic."
         )
 
+    # v11 canvas mode. Per-pair coin: with prob CONSISTENCY_CANVAS_FRAC a pair
+    # is built in canvas mode (dLLM corruption→clean: bidir + marker + uniform
+    # loss); otherwise it keeps the v9 causal construction. The canvas noisy
+    # tile ALWAYS uses fresh uniform-random renoise (spec §2.4/§3.1: decode
+    # re-noises with fresh randoms, so training must too) regardless of
+    # CONSISTENCY_NOISE_SOURCE.
+    _canvas_frac = float(_os.environ.get("CONSISTENCY_CANVAS_FRAC", "0.0"))
+    _canvas_levels = [
+        float(x) for x in _os.environ.get(
+            "CONSISTENCY_CANVAS_LEVELS", "1.0,0.75,0.5,0.25,0.125"
+        ).split(",") if x.strip()
+    ]
+    _canvas_plausible = float(_os.environ.get("CONSISTENCY_CANVAS_PLAUSIBLE_FRAC", "0.0"))
+    if _canvas_frac > 0.0:
+        if triple_mode:
+            raise ValueError("CONSISTENCY_CANVAS_FRAC > 0 is incompatible with triple_mode")
+        if K != 1:
+            raise ValueError(
+                f"CONSISTENCY_CANVAS_FRAC > 0 requires CONSISTENCY_NUM_NOISY_TILES=1, got K={K}"
+            )
+        if not _canvas_levels:
+            raise ValueError("CONSISTENCY_CANVAS_LEVELS parsed to an empty list")
+    T_alloc = int(T_full.max().item()) if B > 0 else 0
+    canvas_pairs = (
+        torch.zeros((B, max(T_alloc, 1)), dtype=torch.bool) if _canvas_frac > 0.0 else None
+    )
+    canvas_mask = (
+        torch.zeros((B, Lmax), dtype=torch.bool) if _canvas_frac > 0.0 else None
+    )
+
+    def _canvas_uniform(n: int, g):
+        if g is not None:
+            return torch.randint(low=0, high=_vocab_size, size=(n,), generator=g, dtype=torch.long)
+        return torch.randint(low=0, high=_vocab_size, size=(n,), dtype=torch.long)
+
+    def _build_canvas_tile(clean_win: torch.Tensor, valid_n: int, g):
+        """Spec §3.2 steps 1-4: input tile = clean window with |R| = round(f*N)
+        positions renoised to fresh uniform-random tokens. R is far-weighted
+        (P(j ∈ R) ∝ 0.5 + j/N — far positions noisier, approximating the
+        decode-time spatial age profile). Pad-tail positions (≥ valid_n, last
+        block off-policy only) are filled with noise; the loss masks them out
+        via pad_mask. Returns (tile, renoise_index_tensor)."""
+        tile = torch.empty(N, dtype=torch.long)
+        tile[:valid_n] = clean_win[:valid_n].long()
+        if valid_n < N:
+            tile[valid_n:] = _canvas_uniform(N - valid_n, g)
+        if g is not None:
+            f_i = int(torch.randint(low=0, high=len(_canvas_levels), size=(1,), generator=g).item())
+        else:
+            f_i = int(torch.randint(low=0, high=len(_canvas_levels), size=(1,)).item())
+        f = _canvas_levels[f_i]
+        n_renoise = min(N, int(round(f * N)))
+        if n_renoise <= 0:
+            return tile, torch.empty(0, dtype=torch.long)
+        w = 0.5 + torch.arange(N, dtype=torch.float32) / float(N)
+        if g is not None:
+            R = torch.multinomial(w, n_renoise, replacement=False, generator=g)
+        else:
+            R = torch.multinomial(w, n_renoise, replacement=False)
+        tile[R] = _canvas_uniform(n_renoise, g)
+        return tile, R
+
     for b in range(B):
         Pb = int(P[b].item())
         Tb = int(T_full[b].item())
@@ -387,6 +460,16 @@ def build_interleaved_batch(
             # of jumping over the gap, fixing a training-inference mismatch.
             cursor = Pb  # next packed offset (variable layout for on-policy)
             for j in range(Tb):
+                # v11 canvas coin. Drawn ONLY when canvas mode is on, so the
+                # legacy RNG stream (and therefore the packed batch) stays
+                # bit-identical when CONSISTENCY_CANVAS_FRAC is 0/unset.
+                is_canvas = False
+                if _canvas_frac > 0.0:
+                    if generator is not None:
+                        coin = torch.rand((), generator=generator)
+                    else:
+                        coin = torch.rand(())
+                    is_canvas = bool(coin.item() < _canvas_frac)
                 if cascade_drafts is not None:
                     # Variable layout: each pair occupies N (noisy) + clean_size_j.
                     clean_size_j = int(onpol_clean_sizes[b][j])
@@ -414,7 +497,7 @@ def build_interleaved_batch(
                     # via uniform-vocab noise. The matched prefix [0, pml)
                     # stays untouched so the trust-the-prefix signal is preserved.
                     _corrupt_p = float(_os.environ.get("CONSISTENCY_DRAFT_CORRUPT_PROB", "0.0"))
-                    if _corrupt_p > 0.0 and pml < N:
+                    if _corrupt_p > 0.0 and pml < N and not is_canvas:
                         sub_n = N - pml
                         if generator is not None:
                             keep_or_corrupt = torch.bernoulli(
@@ -443,6 +526,47 @@ def build_interleaved_batch(
                     r_end = min((j + 1) * N, int(Rn[b].item()))
                     onpol_noisy = None
                 valid_n = r_end - r_start
+                if is_canvas:
+                    # Canvas pair: REPLACE the noisy input (cascade draft or
+                    # legacy uniform draw) with the §3.2 corruption of the
+                    # CLEAN window. There is no cascade-converged prefix in
+                    # canvas mode — zero the pml so the loss treats every
+                    # position uniformly.
+                    clean_win = response_ids[b][r_start:r_end]
+                    canvas_tile, renoise_R = _build_canvas_tile(clean_win, valid_n, generator)
+                    # Plausible substitutions (ρ): a fraction of the KEPT
+                    # positions get a model-believed alternative from the
+                    # cascade alt pools instead of ground truth (decode-time
+                    # kept tokens are model-chosen, occasionally confident-
+                    # wrong). On-policy only; off-policy has no pools (spec
+                    # v1 fallback: skip).
+                    if _canvas_plausible > 0.0 and cascade_drafts is not None:
+                        all_trajs_b = getattr(cascade_drafts, "all_trajs", None)
+                        src_list = (
+                            all_trajs_b[b]
+                            if all_trajs_b is not None and b < len(all_trajs_b)
+                            else cascade_drafts[b]
+                        )
+                        pools = _build_alt_pools(src_list, r_start, N)
+                        in_R = torch.zeros(N, dtype=torch.bool)
+                        if renoise_R.numel() > 0:
+                            in_R[renoise_R] = True
+                        for i_pos in range(min(valid_n, N)):
+                            if bool(in_R[i_pos]) or not pools[i_pos]:
+                                continue
+                            if generator is not None:
+                                u = torch.rand((), generator=generator)
+                                pick = torch.randint(0, len(pools[i_pos]), (1,), generator=generator)
+                            else:
+                                u = torch.rand(())
+                                pick = torch.randint(0, len(pools[i_pos]), (1,))
+                            if float(u.item()) < _canvas_plausible:
+                                canvas_tile[i_pos] = int(pools[i_pos][int(pick.item())])
+                    onpol_noisy = canvas_tile
+                    if onpolicy_prefix_lens is not None:
+                        onpolicy_prefix_lens[b, j] = 0
+                    canvas_pairs[b, j] = True
+                    canvas_mask[b, group_start : group_start + N] = True
                 # Position IDs span the actual response positions for this pair.
                 # (In on-policy mode, r_start can be arbitrary, not just j*N.)
                 shared_pos = torch.arange(Pb + r_start, Pb + r_start + N, dtype=torch.long)
@@ -576,6 +700,8 @@ def build_interleaved_batch(
         clean_starts=clean_starts,
         role_per_pos=role_per_pos,
         pair_idx_per_pos=pair_idx_per_pos,
+        canvas_pairs=canvas_pairs,
+        canvas_mask=canvas_mask,
     )
 
 

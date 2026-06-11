@@ -416,6 +416,9 @@ def compute_consistency_loss(
         role_per_pos=getattr(batch, "role_per_pos", None),
         pair_idx_per_pos=getattr(batch, "pair_idx_per_pos", None),
         noisy_starts=getattr(batch, "noisy_starts", None),
+        # v11: canvas pairs get full-bidir intra-tile attention; causal pairs
+        # keep causal_region_size behavior. None when canvas mode is off.
+        canvas_pairs=getattr(batch, "canvas_pairs", None),
     )
     if _diag_once:
         print(
@@ -463,11 +466,17 @@ def compute_consistency_loss(
         embed_layer = _emb_owner.get_input_embeddings()
         inputs_embeds = embed_layer(batch.input_ids)
         # In triple_mode we ONLY add the marker at the marked-noisy slot, not
-        # at unmarked-noisy. In 2-block mode the marker covers all noisy.
+        # at unmarked-noisy. In 2-block mode the marker covers all noisy —
+        # EXCEPT in v11 canvas mode, where only canvas-pair noisy positions
+        # are marked (causal pairs must stay unmarked: graduation at decode
+        # time = dropping the marker, and the AR mode never sees it).
         if triple_mode and batch.marked_mask is not None:
-            inject_mask = batch.marked_mask.to(inputs_embeds.dtype).unsqueeze(-1)
+            inject_bool = batch.marked_mask
+        elif getattr(batch, "canvas_mask", None) is not None:
+            inject_bool = batch.canvas_mask
         else:
-            inject_mask = batch.noisy_mask.to(inputs_embeds.dtype).unsqueeze(-1)
+            inject_bool = batch.noisy_mask
+        inject_mask = inject_bool.to(inputs_embeds.dtype).unsqueeze(-1)
 
         if marker_type == "sinusoidal":
             # Per-block-index fixed sinusoidal encoding. Each noisy position
@@ -577,6 +586,15 @@ def compute_consistency_loss(
         zero = logits.sum() * 0.0
         return zero, None, {"cons_loss": 0.0, "cons_n_pairs": 0, "cons_n_pos": 0}
 
+    # v11: per-position canvas flag (True = position belongs to a canvas pair).
+    # Canvas pairs take a UNIFORM per-position weight in the decay-weighted
+    # paths below — the decay weighting is an AR-zone (prefix-gated Jacobi
+    # acceptance) concept; on the canvas all positions matter equally.
+    canvas_per_pos = None
+    _cv_tbl = getattr(batch, "canvas_pairs", None)
+    if _cv_tbl is not None and pair_idx is not None:
+        canvas_per_pos = _cv_tbl[b_idx, pair_idx]
+
     student_noisy = logits[b_idx, k_pos, :]           # (n_pos, V) — cons predictor (marked-noisy in triple mode)
     student_clean = logits[b_idx, l_pos, :]           # (n_pos, V) — clean-position predictions
 
@@ -668,6 +686,11 @@ def compute_consistency_loss(
         elif _os.environ.get("CONSISTENCY_MASK_TAIL", "0").lower() in {"1", "true", "yes"}:
             # Idea A: mask-tail target. Clean CE on [pml, pml+margin), mask-token
             # CE on [pml+margin, N). Flat-weighted (decay dropped by design).
+            if canvas_per_pos is not None and bool(canvas_per_pos.any()):
+                raise ValueError(
+                    "CONSISTENCY_MASK_TAIL is incompatible with canvas pairs "
+                    "(margin/mask-token targets are an AR-zone concept)."
+                )
             _mask_id = int(_os.environ.get("CONSISTENCY_MASK_TOKEN_ID", "151643"))
             _margin = int(_os.environ.get("CONSISTENCY_MASK_MARGIN", "8"))
             cons_loss, _n_clean, _n_mask = _mask_tail_dflash_loss(
@@ -709,6 +732,9 @@ def compute_consistency_loss(
                 else:
                     shifted = pos_v.to(per_pos_losses.dtype)
                 w = torch.exp(-shifted / gamma)
+                # v11 canvas pairs: uniform weight (no position decay).
+                if canvas_per_pos is not None:
+                    w = torch.where(canvas_per_pos[valid], torch.ones_like(w), w)
 
                 # Focal weighting: stack on top of dflash decay.
                 # `(1 - p_correct)^focal_gamma` upweights confidently-wrong
@@ -749,6 +775,10 @@ def compute_consistency_loss(
                 pref = torch.zeros_like(per_pos)
             shifted = pos_in_block.to(per_pos.dtype) - pref
             w = torch.exp(-shifted.clamp_min(0.0) / gamma) * (shifted >= 0).to(per_pos.dtype)
+            # v11 canvas pairs: uniform weight (no decay, no prefix gating —
+            # canvas pml is zeroed in pack.py; all positions matter equally).
+            if canvas_per_pos is not None:
+                w = torch.where(canvas_per_pos, torch.ones_like(w), w)
             cons_loss = (per_pos * w).sum() / w.sum().clamp_min(1e-12)
         else:
             cons_loss = soft_cross_entropy(student_noisy, teacher_clean, T_soft=T_soft,
@@ -795,6 +825,8 @@ def compute_consistency_loss(
         "cons_n_pairs": int(batch.num_pairs.sum().item()),
         "cons_n_pos": n_pos,
     }
+    if canvas_per_pos is not None:
+        metrics["cons_canvas_pos_frac"] = float(canvas_per_pos.float().mean().item())
     # Argmax-on-noisy metric: does student.argmax at the noisy position match
     # the NEXT clean response token? This is what actually determines Jacobi
     # acceptance (TPF), independent of which loss variant (CE/KL/forward/reverse)
@@ -818,9 +850,19 @@ def compute_consistency_loss(
                 n_vm = (l_pos + 1)[valid_m]
                 gt_m = batch.input_ids[b_vm, n_vm]
                 pred_m = logits[b_vm, k_vm, :].argmax(dim=-1)
-                argmax_correct = float((pred_m == gt_m).float().mean().item())
-                metrics["cons_argmax_correct"] = argmax_correct
+                correct_vec = (pred_m == gt_m).float()
+                metrics["cons_argmax_correct"] = float(correct_vec.mean().item())
                 metrics["cons_argmax_n_valid"] = int(valid_m.sum().item())
+                # v11: split by pair mode — canvas argmax_correct is the
+                # canvas-training progress signal; causal must hold v9 levels.
+                if canvas_per_pos is not None:
+                    cv_m = canvas_per_pos[valid_m]
+                    if bool(cv_m.any()):
+                        metrics["cons_argmax_correct_canvas"] = float(correct_vec[cv_m].mean().item())
+                        metrics["cons_argmax_n_canvas"] = int(cv_m.sum().item())
+                    if bool((~cv_m).any()):
+                        metrics["cons_argmax_correct_causal"] = float(correct_vec[~cv_m].mean().item())
+                        metrics["cons_argmax_n_causal"] = int((~cv_m).sum().item())
     if anchor_loss is not None:
         metrics["anchor_loss"] = float(anchor_loss.detach().item())
     if student_teacher_kl_clean is not None:

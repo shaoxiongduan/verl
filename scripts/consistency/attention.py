@@ -34,6 +34,7 @@ def make_mask_mod(
     triple_mode: bool = False,
     causal_region_size: int = 0,
     num_noisy_tiles: int = 1,
+    canvas_pairs: torch.Tensor | None = None,
 ):
     """Build a mask_mod closure with batched per-sample metadata baked in.
     Returns a callable `(b, h, q, k) -> bool` (broadcastable).
@@ -60,7 +61,15 @@ def make_mask_mod(
              constraint). Matches dFlash / Fast-dLLM v2 within-block attention.
              AR-equivalence is lost; only use when AR equivalence isn't needed.
         N >= block_len : effectively pure causal (no positions in bidir region).
+
+    canvas_pairs (v11): optional (B, T_max) bool. Pairs flagged True are
+      CANVAS pairs — their noisy tile is fully bidirectional within itself
+      (cr=-1 semantics) regardless of `causal_region_size`, which continues
+      to govern the non-canvas (causal) pairs. None → bit-identical legacy
+      behavior. 2-block mode only.
     """
+    if triple_mode and canvas_pairs is not None:
+        raise ValueError("canvas_pairs is incompatible with triple_mode")
     P_t = prompt_lens
     T_t = num_pairs
     N_t = torch.clamp(block_lens, min=1)
@@ -115,13 +124,19 @@ def make_mask_mod(
             if hybrid_mask:
                 q_in_block = q - ks_
                 q_in_causal = q_in_block < cr
-                same_noisy_attn = same_noisy_tile & (k >= ks_) & (
-                    (q_in_causal & (k <= q)) | (~q_in_causal)
-                )
+                allow_in_tile = (q_in_causal & (k <= q)) | (~q_in_causal)
             elif full_bidir:
+                allow_in_tile = None  # whole tile already allowed
+            else:
+                allow_in_tile = k <= q
+            if canvas_pairs is not None and allow_in_tile is not None:
+                # Canvas pairs: full bidir within their own noisy tile,
+                # independent of the global causal_region_size.
+                allow_in_tile = allow_in_tile | canvas_pairs[b, j_q]
+            if allow_in_tile is None:
                 same_noisy_attn = same_noisy_tile & (k >= ks_)
             else:
-                same_noisy_attn = same_noisy_tile & (k >= ks_) & (k <= q)
+                same_noisy_attn = same_noisy_tile & (k >= ks_) & allow_in_tile
 
             mask_noisy = is_noisy_q & (is_prompt_k | clean_in_prev_clean | same_noisy_attn)
             mask_clean = is_clean_q & (
@@ -218,6 +233,7 @@ def make_mask_mod_variable(
     noisy_starts: torch.Tensor,        # (B, T_max) start position of noisy block-0 per pair
     pad_mask: torch.Tensor,            # (B, Lmax) bool
     block_len: int = 32,               # N (block size); needed to compute tile_id for K>1 on-policy
+    canvas_pairs: torch.Tensor | None = None,  # (B, T_max) bool — v11 canvas pairs (full bidir in own tile)
 ):
     """Variable-layout mask: uses per-position role/pair_idx lookups instead
     of modular arithmetic from a uniform stride. Required for on-policy bridge
@@ -262,12 +278,17 @@ def make_mask_mod_variable(
         own_noisy_start_k = NS[b, pair_k_safe]
         tile_q = torch.div(q - own_noisy_start_q, N, rounding_mode="floor")
         tile_k = torch.div(k - own_noisy_start_k, N, rounding_mode="floor")
+        # v11 canvas pairs: full bidir within the tile. The upper bound is
+        # implied by tile_q == tile_k (k stays inside q's own N-token tile).
+        in_tile_allow = k <= q
+        if canvas_pairs is not None:
+            in_tile_allow = in_tile_allow | canvas_pairs[b, pair_q_safe]
         same_pair_noisy_attn = (
             is_noisy_q & is_noisy_k
             & (pair_q == pair_k)
             & (tile_q == tile_k)
             & (k >= own_noisy_start_q + tile_q * N)
-            & (k <= q)
+            & in_tile_allow
         )
         mask_noisy = is_noisy_q & (is_prompt_k | clean_in_prev_clean | same_pair_noisy_attn)
         mask_clean = is_clean_q & (is_prompt_k | clean_in_prev_clean | same_pair_clean_attn)
@@ -289,6 +310,7 @@ def build_sdpa_attention_mask(
     role_per_pos: torch.Tensor | None = None,
     pair_idx_per_pos: torch.Tensor | None = None,
     noisy_starts: torch.Tensor | None = None,
+    canvas_pairs: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Materialize the boolean attention pattern into a (B, 1, Lmax, Lmax)
     additive float mask. 0.0 = allowed, -inf = blocked. SDPA broadcasts
@@ -320,12 +342,14 @@ def build_sdpa_attention_mask(
             noisy_starts=noisy_starts,
             pad_mask=pad_mask,
             block_len=N_for_mask,
+            canvas_pairs=canvas_pairs,
         )
     else:
         fn = make_mask_mod(
             prompt_lens, num_pairs, block_lens, pad_mask,
             triple_mode=triple_mode, causal_region_size=causal_region_size,
             num_noisy_tiles=num_noisy_tiles,
+            canvas_pairs=canvas_pairs,
         )
 
     b_idx = torch.arange(B, device=device).view(B, 1, 1).expand(B, Lmax, Lmax)

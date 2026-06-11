@@ -951,9 +951,12 @@ def maybe_add_consistency_loss(
 
     # Load the marker embed from disk if marker is enabled (avoids the
     # FSDP-sharded `embed.weight[marker_id]` size-0 storage problem).
+    # Only the "embed" marker type reads a row from disk; "sinusoidal" and
+    # "constant" are computed analytically in loss.py with no FSDP exposure.
     use_marker = _read("use_draft_marker", False, lambda v: str(v).lower() in {"1", "true", "yes"})
+    marker_type = _read("marker_type", "embed", lambda v: str(v).lower())
     marker_embed_override = None
-    if use_marker:
+    if use_marker and marker_type == "embed":
         marker_path = _read("marker_path", "", str) or _read("teacher_path", "", str)
         marker_id_local = _read("marker_token_id", 151665, int)
         if marker_path:
@@ -987,6 +990,22 @@ def maybe_add_consistency_loss(
         )
         if cascade_drafts is None and _read("debug", False, lambda v: str(v).lower() in {"1", "true", "yes"}):
             print("[cons-onpolicy] no jacobi_trajectories in micro_batch; falling back to uniform noise", flush=True)
+
+    # v11 canvas mode: knobs are read directly from env inside pack.py
+    # (CONSISTENCY_CANVAS_FRAC / _LEVELS / _PLAUSIBLE_FRAC, consistent with
+    # the other pack-level env knobs). One-shot announce so run logs show
+    # the active canvas configuration.
+    if not getattr(maybe_add_consistency_loss, "_canvas_announced", False):
+        maybe_add_consistency_loss._canvas_announced = True
+        _cv_frac = os.environ.get("CONSISTENCY_CANVAS_FRAC", "0.0")
+        if float(_cv_frac) > 0.0:
+            print(
+                f"[cons-canvas] v11 canvas mode ACTIVE: frac={_cv_frac} "
+                f"levels={os.environ.get('CONSISTENCY_CANVAS_LEVELS', '1.0,0.75,0.5,0.25,0.125')} "
+                f"plausible_frac={os.environ.get('CONSISTENCY_CANVAS_PLAUSIBLE_FRAC', '0.0')} "
+                f"marker={'ON type=' + marker_type if use_marker else 'OFF'}",
+                flush=True,
+            )
 
     cons_loss, anchor_loss, cons_metrics = compute_consistency_loss(
         model=engine.module,
