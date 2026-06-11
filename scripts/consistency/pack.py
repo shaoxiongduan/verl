@@ -364,6 +364,28 @@ def build_interleaved_batch(
         ).split(",") if x.strip()
     ]
     _canvas_plausible = float(_os.environ.get("CONSISTENCY_CANVAS_PLAUSIBLE_FRAC", "0.0"))
+    # v11.1: canvas tile construction mode.
+    #   "levels"    (default) — v11.0 f-mixture corruption of the clean window.
+    #   "empirical" — match the MEASURED hybrid-decode state distribution
+    #     (trace audit 2026-06-12): under the keep-everything update the canvas
+    #     holds the model's own previous predictions — correct with a
+    #     position-decaying probability p(j) (P_NEAR at the boundary → P_FAR at
+    #     depth), wrong-but-plausible otherwise — plus a fresh-noise tail of
+    #     n_new ~ U{0..MAX_COMMIT} newly-entered positions. Wrong tokens are
+    #     drawn from the policy's own cascade prediction pools (the on-policy
+    #     side-channel already recorded at rollout; fresh noise fallback).
+    #     A LEVELS_FRAC fraction of canvas pairs keeps the f-mixture for
+    #     coverage of the all-noise regime (fresh window starts).
+    _canvas_construction = _os.environ.get("CONSISTENCY_CANVAS_CONSTRUCTION", "levels").lower()
+    _canvas_levels_frac = float(_os.environ.get("CONSISTENCY_CANVAS_LEVELS_FRAC", "0.25"))
+    _canvas_p_near = float(_os.environ.get("CONSISTENCY_CANVAS_P_NEAR", "0.6"))
+    _canvas_p_far = float(_os.environ.get("CONSISTENCY_CANVAS_P_FAR", "0.1"))
+    _canvas_max_commit = int(_os.environ.get("CONSISTENCY_CANVAS_MAX_COMMIT", "8"))
+    if _canvas_construction not in ("levels", "empirical"):
+        raise ValueError(
+            f"CONSISTENCY_CANVAS_CONSTRUCTION must be 'levels' or 'empirical', "
+            f"got {_canvas_construction!r}"
+        )
     if _canvas_frac > 0.0:
         if triple_mode:
             raise ValueError("CONSISTENCY_CANVAS_FRAC > 0 is incompatible with triple_mode")
@@ -412,6 +434,37 @@ def build_interleaved_batch(
             R = torch.multinomial(w, n_renoise, replacement=False)
         tile[R] = _canvas_uniform(n_renoise, g)
         return tile, R
+
+    def _build_canvas_tile_empirical(clean_win: torch.Tensor, valid_n: int,
+                                     pools: "list[list[int]] | None", g):
+        """v11.1 empirical-state tile (see _canvas_construction docstring).
+        Body position j: clean token w.p. p(j) = P_NEAR·(P_FAR/P_NEAR)^(j/(N-1)),
+        else a policy-predicted alternative from pools[j] (uniform-noise
+        fallback when no pool). Tail of n_new ~ U{0..MAX_COMMIT} positions =
+        fresh uniform noise (newly entered at the window's far end)."""
+        tile = torch.empty(N, dtype=torch.long)
+        if g is not None:
+            n_new = int(torch.randint(0, _canvas_max_commit + 1, (1,), generator=g).item())
+            u_vec = torch.rand(N, generator=g)
+            pick_vec = torch.rand(N, generator=g)
+        else:
+            n_new = int(torch.randint(0, _canvas_max_commit + 1, (1,)).item())
+            u_vec = torch.rand(N)
+            pick_vec = torch.rand(N)
+        body_end = max(0, N - n_new)
+        ratio = _canvas_p_far / max(_canvas_p_near, 1e-9)
+        for j in range(N):
+            if j >= body_end or j >= valid_n:
+                tile[j] = _canvas_uniform(1, g)[0]
+                continue
+            p_j = _canvas_p_near * (ratio ** (j / max(1, N - 1)))
+            if float(u_vec[j]) < p_j:
+                tile[j] = clean_win[j]
+            elif pools is not None and pools[j]:
+                tile[j] = int(pools[j][int(float(pick_vec[j]) * len(pools[j])) % len(pools[j])])
+            else:
+                tile[j] = _canvas_uniform(1, g)[0]
+        return tile
 
     for b in range(B):
         Pb = int(P[b].item())
@@ -528,19 +581,18 @@ def build_interleaved_batch(
                 valid_n = r_end - r_start
                 if is_canvas:
                     # Canvas pair: REPLACE the noisy input (cascade draft or
-                    # legacy uniform draw) with the §3.2 corruption of the
-                    # CLEAN window. There is no cascade-converged prefix in
-                    # canvas mode — zero the pml so the loss treats every
-                    # position uniformly.
+                    # legacy uniform draw) with a corruption of the CLEAN
+                    # window. There is no cascade-converged prefix in canvas
+                    # mode — zero the pml so the loss treats every position
+                    # uniformly.
                     clean_win = response_ids[b][r_start:r_end]
-                    canvas_tile, renoise_R = _build_canvas_tile(clean_win, valid_n, generator)
-                    # Plausible substitutions (ρ): a fraction of the KEPT
-                    # positions get a model-believed alternative from the
-                    # cascade alt pools instead of ground truth (decode-time
-                    # kept tokens are model-chosen, occasionally confident-
-                    # wrong). On-policy only; off-policy has no pools (spec
-                    # v1 fallback: skip).
-                    if _canvas_plausible > 0.0 and cascade_drafts is not None:
+                    # Alt pools (the policy's own rollout-time predictions at
+                    # these positions): used by the empirical construction for
+                    # wrong-but-plausible tokens and by the ρ plausible-subs.
+                    pools = None
+                    if cascade_drafts is not None and (
+                        _canvas_construction == "empirical" or _canvas_plausible > 0.0
+                    ):
                         all_trajs_b = getattr(cascade_drafts, "all_trajs", None)
                         src_list = (
                             all_trajs_b[b]
@@ -548,20 +600,43 @@ def build_interleaved_batch(
                             else cascade_drafts[b]
                         )
                         pools = _build_alt_pools(src_list, r_start, N)
-                        in_R = torch.zeros(N, dtype=torch.bool)
-                        if renoise_R.numel() > 0:
-                            in_R[renoise_R] = True
-                        for i_pos in range(min(valid_n, N)):
-                            if bool(in_R[i_pos]) or not pools[i_pos]:
-                                continue
-                            if generator is not None:
-                                u = torch.rand((), generator=generator)
-                                pick = torch.randint(0, len(pools[i_pos]), (1,), generator=generator)
-                            else:
-                                u = torch.rand(())
-                                pick = torch.randint(0, len(pools[i_pos]), (1,))
-                            if float(u.item()) < _canvas_plausible:
-                                canvas_tile[i_pos] = int(pools[i_pos][int(pick.item())])
+                    # Per-pair construction choice: empirical mode keeps a
+                    # LEVELS_FRAC fraction of pairs on the f-mixture for
+                    # all-noise-regime coverage.
+                    use_levels = _canvas_construction == "levels"
+                    if not use_levels and _canvas_levels_frac > 0.0:
+                        if generator is not None:
+                            lc = torch.rand((), generator=generator)
+                        else:
+                            lc = torch.rand(())
+                        use_levels = bool(lc.item() < _canvas_levels_frac)
+                    if not use_levels:
+                        canvas_tile = _build_canvas_tile_empirical(
+                            clean_win, valid_n, pools, generator
+                        )
+                    else:
+                        canvas_tile, renoise_R = _build_canvas_tile(clean_win, valid_n, generator)
+                        # Plausible substitutions (ρ): a fraction of the KEPT
+                        # positions get a model-believed alternative from the
+                        # cascade alt pools instead of ground truth (decode-time
+                        # kept tokens are model-chosen, occasionally confident-
+                        # wrong). On-policy only; off-policy has no pools (spec
+                        # v1 fallback: skip).
+                        if _canvas_plausible > 0.0 and pools is not None:
+                            in_R = torch.zeros(N, dtype=torch.bool)
+                            if renoise_R.numel() > 0:
+                                in_R[renoise_R] = True
+                            for i_pos in range(min(valid_n, N)):
+                                if bool(in_R[i_pos]) or not pools[i_pos]:
+                                    continue
+                                if generator is not None:
+                                    u = torch.rand((), generator=generator)
+                                    pick = torch.randint(0, len(pools[i_pos]), (1,), generator=generator)
+                                else:
+                                    u = torch.rand(())
+                                    pick = torch.randint(0, len(pools[i_pos]), (1,))
+                                if float(u.item()) < _canvas_plausible:
+                                    canvas_tile[i_pos] = int(pools[i_pos][int(pick.item())])
                     onpol_noisy = canvas_tile
                     if onpolicy_prefix_lens is not None:
                         onpolicy_prefix_lens[b, j] = 0

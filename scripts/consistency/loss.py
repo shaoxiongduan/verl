@@ -591,6 +591,7 @@ def compute_consistency_loss(
     # paths below — the decay weighting is an AR-zone (prefix-gated Jacobi
     # acceptance) concept; on the canvas all positions matter equally.
     canvas_per_pos = None
+    canvas_split_terms = None  # populated by the v11.1 split-objective path
     _cv_tbl = getattr(batch, "canvas_pairs", None)
     if _cv_tbl is not None and pair_idx is not None:
         canvas_per_pos = _cv_tbl[b_idx, pair_idx]
@@ -755,7 +756,63 @@ def compute_consistency_loss(
                 cons_loss = logits.sum() * 0.0
     else:
         kl_decay = _os.environ.get("CONSISTENCY_KL_DECAY", "0").lower() in {"1", "true", "yes"}
-        if kl_decay and pos_in_block is not None:
+        # v11.1: split-objective mode. CONSISTENCY_CANVAS_LOSS=ce routes canvas
+        # positions to uniform shift-by-1 CE against the CLEAN ROLLOUT TOKENS
+        # (the decode-aligned target — the AR zone verifies the policy's own
+        # greedy text, so KL-to-base would cap canvas accuracy at base↔policy
+        # agreement). Causal positions keep the v9 KL(+decay)-to-teacher path
+        # untouched. CONSISTENCY_CANVAS_WEIGHT_MULT scales ONLY the canvas
+        # term (the new capability needs more than λ's ~1% gradient share;
+        # the causal preservation pressure stays at the proven v9 level).
+        canvas_loss_mode = _os.environ.get("CONSISTENCY_CANVAS_LOSS", "").lower()
+        canvas_mult = float(_os.environ.get("CONSISTENCY_CANVAS_WEIGHT_MULT", "1.0"))
+        if (canvas_loss_mode == "ce" and canvas_per_pos is not None
+                and pos_in_block is not None and bool(canvas_per_pos.any())):
+            cv = canvas_per_pos
+            ncv = ~cv
+            if bool(ncv.any()):
+                per_pos_c = soft_cross_entropy(
+                    student_noisy[ncv], teacher_clean[ncv], T_soft=T_soft,
+                    divergence=divergence, reduction="none",
+                ) * (T_soft * T_soft)
+                if kl_decay:
+                    gamma = float(_os.environ.get("CONSISTENCY_DFLASH_GAMMA", "12.0"))
+                    opl = getattr(batch, "onpolicy_prefix_lens", None)
+                    if opl is not None and pair_idx is not None:
+                        pref_c = opl[b_idx, pair_idx][ncv].to(per_pos_c.dtype)
+                    else:
+                        pref_c = torch.zeros_like(per_pos_c)
+                    shifted_c = pos_in_block[ncv].to(per_pos_c.dtype) - pref_c
+                    w_c = torch.exp(-shifted_c.clamp_min(0.0) / gamma) * (shifted_c >= 0).to(per_pos_c.dtype)
+                    causal_term = (per_pos_c * w_c).sum() / w_c.sum().clamp_min(1e-12)
+                else:
+                    causal_term = per_pos_c.mean()
+            else:
+                causal_term = logits.sum() * 0.0
+            # Canvas half: uniform-weight shift-by-1 CE to the next clean
+            # rollout token (same convention as the dflash_ce path).
+            Nb_cv = int(batch.block_lens[0].item())
+            next_pos_cv = l_pos + 1
+            valid_cv = cv & (pos_in_block < (Nb_cv - 1))
+            np_cl = torch.clamp(next_pos_cv, max=batch.pad_mask.shape[-1] - 1)
+            valid_cv = valid_cv & batch.pad_mask[b_idx, np_cl]
+            if bool(valid_cv.any()):
+                b_v = b_idx[valid_cv]
+                k_v = k_pos[valid_cv]
+                n_v = next_pos_cv[valid_cv]
+                canvas_term = F.cross_entropy(
+                    logits[b_v, k_v, :].float(), batch.input_ids[b_v, n_v],
+                    reduction="mean",
+                )
+            else:
+                canvas_term = logits.sum() * 0.0
+            cons_loss = causal_term + canvas_mult * canvas_term
+            canvas_split_terms = (
+                float(causal_term.detach().item()),
+                float(canvas_term.detach().item()),
+                canvas_mult,
+            )
+        elif kl_decay and pos_in_block is not None:
             # dFlash-style position decay on the soft (KL) loss, mirroring the
             # dflash_ce path: (a) mask out cascade-converged prefix positions
             # (pos < pml — their KL is trivially small and dilutes the loss),
@@ -827,6 +884,10 @@ def compute_consistency_loss(
     }
     if canvas_per_pos is not None:
         metrics["cons_canvas_pos_frac"] = float(canvas_per_pos.float().mean().item())
+    if canvas_split_terms is not None:
+        metrics["cons_causal_term"] = canvas_split_terms[0]
+        metrics["cons_canvas_term"] = canvas_split_terms[1]
+        metrics["cons_canvas_weight_mult"] = canvas_split_terms[2]
     # Argmax-on-noisy metric: does student.argmax at the noisy position match
     # the NEXT clean response token? This is what actually determines Jacobi
     # acceptance (TPF), independent of which loss variant (CE/KL/forward/reverse)
