@@ -1726,3 +1726,15 @@ Readings:
    lower CANVAS_FRAC (0.5→0.3) or raise CONSISTENCY_WEIGHT.
 3. In-training canvas argmax: 0.25→0.38 (steps 5→80). MATH val 0.886-0.890
    (≥0.88 criterion holding).
+
+**Correction (fable, 2026-06-11 18:15): criterion 1 reframed.** v11 step 80 has
+300 TOTAL RL steps (220 v9-init + 80). Matched-step control is v9_300 =
+vanilla 3.27 / reppen 3.58 (late-RL TPF collapse, 2026-06-11 entry) — v11's
+3.56 / 3.72 is eroding SLOWER than v9's own trajectory despite β=0.5 halving
+causal-cons pressure. The asm causal-control falling in lockstep (3.64→3.39,
+no canvas involvement at decode) corroborates ambient late-RL erosion, not
+v11-specific damage. Revised criterion 1: causal mode ≥ v9-at-matched-total-
+steps. No env change; re-eval at 160 (healthy = vanilla ≳3.3-3.5). If
+intervention ever needed: 2× CONSISTENCY_WEIGHT, keep CANVAS_FRAC=0.5.
+Checkpoint selection may simply favor early ckpts (80-160) — selection, not
+failure.
