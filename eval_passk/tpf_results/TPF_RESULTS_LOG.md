@@ -1841,3 +1841,22 @@ Ckpts `ckpts_hf/{v11_canvas_base_step_40, v11p1_canvas_base_step_40}`; raw in
   ~2.5pp MATH val (0.828 vs ~0.853 @ s100). Watch at s200; knob = mult 10→5.
 - In-training (different input dists, not comparable directly): canvas argmax
   0.52 (v11.1-base s115) vs 0.34 (v11-base s140); grad_norm ~0.12 (no clip).
+
+## 2026-06-12 — Base-init runs: checkpoint sweep s40-s120 (argmax protocol, jsim-16)
+
+| ckpt | vanilla | reppen | asm causal | asm bidir+mk | gap |
+|---|---:|---:|---:|---:|---:|
+| v11p1-base s40  | **4.108** | — | 4.011 | 3.816 | −0.195 |
+| v11p1-base s80  | 4.059 | 3.851 (pp 4.012) | 3.966 | 3.843 | −0.123 |
+| v11p1-base s120 | 3.956 | 3.844 | 3.796 | 3.640 | −0.156 |
+| v11-base s40    | 3.790 | — | 3.780 | 3.607 | −0.173 |
+| v11-base s120   | 3.660 | 3.708 | 3.638 | 3.526 | −0.112 |
+
+1. v11.1 recipe leads at every matched step (+0.30 vanilla at s120) but the
+   ambient RL erosion is present: −0.15/80 steps (vs v9's −0.5/80 — 3x slower).
+   Even s120 (3.96) beats every non-v11.1 ckpt ever measured incl. v9_220.
+2. Product zone so far = s40-s80. Checkpoint selection, as predicted.
+3. reppen no longer helps on v11.1-base (3.85 < vanilla 4.06 at s80) — the
+   new drafts already avoid the repetition trap reppen patches.
+4. Canvas gap fluctuates −0.12..−0.20, NO crossover; hybrid still trails
+   plain Jacobi on every ckpt.
