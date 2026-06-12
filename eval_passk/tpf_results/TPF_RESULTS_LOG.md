@@ -1819,3 +1819,25 @@ Causal healthy under matched-total-steps criterion (380 total: 3.44 vs v9
 extrapolation ~2.8-3.0; reppen ROSE s80→s160; causal-control erosion flat
 s100→s160). Step-140 in-training argmax spike (0.419) = variance, not regime
 change.
+
+## 2026-06-12 — v11.1 vs v11.0 recipe head-to-head at step 40 (base init, jsim-16)
+
+Identical init (pre-RL JF base), identical protocol (argmax update, 512 tok).
+Ckpts `ckpts_hf/{v11_canvas_base_step_40, v11p1_canvas_base_step_40}`; raw in
+`eval_passk/tpf_results/v11/<ckpt>/`.
+
+| arm | v11-base (f-mix + KL-to-base, mult 1) | v11.1-base (empirical + CE-to-rollout, mult 10) |
+|---|---:|---:|
+| vanilla jsim | 3.790 (pp 3.853) | **4.108 (pp 4.234)** |
+| asm causal/argmax | 3.780 | **4.011** |
+| asm bidir+marker/argmax | 3.607 | **3.816** |
+
+- v11.1-base @ s40 = best vanilla TPF measured on ANY ckpt this project
+  (beats honest base 3.90, v9_220 3.78, ≈ reppen champion 4.10 w/o reppen).
+  Decode-matched partial-corruption CE lifts CAUSAL Jacobi drafting too.
+- Its bidir+marker arm (3.82) beats the old recipe's causal control (3.78).
+- Canvas gap similar (−0.195 vs −0.173) — canvas arm still trails own causal.
+- COST: at matched steps v11.1-base trails v11-base ~0.05 train score and
+  ~2.5pp MATH val (0.828 vs ~0.853 @ s100). Watch at s200; knob = mult 10→5.
+- In-training (different input dists, not comparable directly): canvas argmax
+  0.52 (v11.1-base s115) vs 0.34 (v11-base s140); grad_norm ~0.12 (no clip).
